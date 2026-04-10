@@ -9,12 +9,16 @@ using Serilog.Events;
 using System;
 using System.Collections.Generic;
 using WhatsAppBot.Data;
+using WhatsAppBot.Extensions;
 using WhatsAppBot.Services;
 using WhatsAppBot.Services.Implementations;
 using WhatsAppBot.Services.Interfaces;
 using WhatsAppBot.Services.Scraping;
 using WhatsAppBot.Services.Flights;
 using WhatsAppBot.Models.Flights;
+
+// Load .env file BEFORE any configuration
+ConfigurationExtensions.LoadDotEnv();
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
@@ -36,6 +40,30 @@ try
     var builder = WebApplication.CreateBuilder(args);
     builder.Host.UseSerilog();
 
+    // Override appsettings with environment variables
+    builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+    {
+        ["MetaWhatsApp:GraphBase"] = Environment.GetEnvironmentVariable("WHATSAPP_GRAPH_BASE") ?? builder.Configuration["MetaWhatsApp:GraphBase"],
+        ["MetaWhatsApp:ApiVersion"] = Environment.GetEnvironmentVariable("WHATSAPP_API_VERSION") ?? builder.Configuration["MetaWhatsApp:ApiVersion"],
+        ["MetaWhatsApp:PhoneNumberId"] = Environment.GetEnvironmentVariable("WHATSAPP_PHONE_NUMBER_ID") ?? builder.Configuration["MetaWhatsApp:PhoneNumberId"],
+        ["MetaWhatsApp:AccessToken"] = Environment.GetEnvironmentVariable("WHATSAPP_ACCESS_TOKEN") ?? builder.Configuration["MetaWhatsApp:AccessToken"],
+        ["MetaWhatsApp:VerifyToken"] = Environment.GetEnvironmentVariable("WHATSAPP_VERIFY_TOKEN") ?? builder.Configuration["MetaWhatsApp:VerifyToken"],
+        ["MetaWhatsApp:AppSecret"] = Environment.GetEnvironmentVariable("WHATSAPP_APP_SECRET") ?? builder.Configuration["MetaWhatsApp:AppSecret"],
+        
+        ["AzureOpenAI:Endpoint"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT") ?? builder.Configuration["AzureOpenAI:Endpoint"],
+        ["AzureOpenAI:Deployment"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT") ?? builder.Configuration["AzureOpenAI:Deployment"],
+        ["AzureOpenAI:ApiKey"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY") ?? builder.Configuration["AzureOpenAI:ApiKey"],
+        ["AzureOpenAI:ApiVersion"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION") ?? builder.Configuration["AzureOpenAI:ApiVersion"],
+        
+        ["FlightPricing:AmadeusClientId"] = Environment.GetEnvironmentVariable("AMADEUS_CLIENT_ID") ?? builder.Configuration["FlightPricing:AmadeusClientId"],
+        ["FlightPricing:AmadeusClientSecret"] = Environment.GetEnvironmentVariable("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["FlightPricing:AmadeusClientSecret"],
+        
+        ["CaptchaService:ApiKey"] = Environment.GetEnvironmentVariable("CAPTCHA_API_KEY") ?? string.Empty,
+        ["CaptchaService:Provider"] = Environment.GetEnvironmentVariable("CAPTCHA_SERVICE_PROVIDER") ?? "2captcha",
+        
+        ["ConnectionStrings:DefaultConnection"] = Environment.GetEnvironmentVariable("DATABASE_CONNECTION_STRING") ?? "Data Source=whatsappbot.db"
+    });
+
     builder.Services.AddControllers();
 
     // HttpClientFactory (Meta sending + external calls)
@@ -43,8 +71,9 @@ try
     builder.Services.AddMemoryCache();
 
     // DB
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") ?? "Data Source=whatsappbot.db";
     builder.Services.AddDbContext<AppDbContext>(options =>
-        options.UseSqlite("Data Source=whatsappbot.db"));
+        options.UseSqlite(connectionString));
 
     // Scraping config
     var scrapingSection = builder.Configuration.GetSection("Scraping");
@@ -62,6 +91,9 @@ try
     // Sync engine
     builder.Services.AddScoped<ICatalogSyncService, CatalogSyncService>();
 
+    // CAPTCHA Service
+    builder.Services.AddScoped<ICaptchaService, CaptchaService>();
+
     // Background workers
     builder.Services.AddHostedService<SessionCleanupService>();
     builder.Services.AddHostedService<CatalogSyncHostedService>();
@@ -77,7 +109,7 @@ try
 
     builder.Services.AddScoped<IFlightPricingProvider, DeepLinkFlightPricingProvider>();
 
-    // ===== Register one scraper per airline (if you are using AirlineProductScraper) =====
+    // ===== Register one scraper per airline =====
     var scrapingOptPreview = scrapingSection.Get<ScrapingOptions>() ?? new ScrapingOptions();
     var airlines = scrapingOptPreview.Airlines ?? new List<AirlineTarget>();
 
@@ -117,6 +149,7 @@ try
         service = "WhatsApp Bot",
         status = "Running",
         timestamp = DateTime.UtcNow,
+        version = "2.0",
         endpoints = new
         {
             webhook = "/webhook",
@@ -127,6 +160,7 @@ try
     Log.Information("WhatsApp Bot is ready!");
     Log.Information("Webhook URL: http://localhost:5260/webhook");
     Log.Information("Alt Webhook URL: http://localhost:5260/api/webhook");
+    Log.Information("Environment: {Env}", builder.Environment.EnvironmentName);
     Log.Information("===========================================");
 
     app.Run();
