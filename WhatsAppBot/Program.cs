@@ -104,6 +104,9 @@ try
 
     builder.Services.AddScoped<FlightPricingService>();
 
+    // Self-hosted CAPTCHA solver (FREE!)
+    builder.Services.AddSingleton<SelfCaptchaSolver>();
+
     builder.Services.AddHttpClient<AmadeusFlightPricingProvider>();
     builder.Services.AddScoped<IFlightPricingProvider, AmadeusFlightPricingProvider>();
 
