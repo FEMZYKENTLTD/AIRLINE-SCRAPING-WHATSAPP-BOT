@@ -1,0 +1,242 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using AngleSharp;
+using AngleSharp.Dom;
+using Microsoft.Extensions.Logging;
+using WhatsAppBot.Services.Interfaces;
+
+namespace WhatsAppBot.Services.Scraping
+{
+    /// <summary>
+    /// Enhanced polite crawler with CAPTCHA bypass support
+    /// </summary>
+    public class SafeCrawler
+    {
+        private readonly HttpClient _http;
+        private readonly ScrapingOptions _opts;
+        private readonly ICaptchaService? _captchaService;
+        private readonly ILogger<SafeCrawler>? _logger;
+
+        public SafeCrawler(
+            HttpClient http, 
+            ScrapingOptions opts, 
+            ICaptchaService? captchaService = null,
+            ILogger<SafeCrawler>? logger = null)
+        {
+            _http = http;
+            _opts = opts;
+            _captchaService = captchaService;
+            _logger = logger;
+        }
+
+        public async Task<List<(Uri Url, IDocument Doc)>> CrawlAsync(
+            Uri startUrl,
+            string allowedHost,
+            CancellationToken ct)
+        {
+            var results = new List<(Uri, IDocument)>();
+            var queue = new Queue<(Uri Url, int Depth)>();
+            queue.Enqueue((startUrl, 0));
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var config = Configuration.Default;
+
+            while (queue.Count > 0 && results.Count < _opts.MaxPagesPerSite)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var (url, depth) = queue.Dequeue();
+
+                if (!string.Equals(url.Host, allowedHost, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var key = url.ToString();
+                if (!seen.Add(key))
+                    continue;
+
+                if (LooksLikeBinaryAsset(url))
+                    continue;
+
+                // Fetch HTML with CAPTCHA handling
+                var html = await GetHtmlWithCaptchaHandlingAsync(url, ct);
+                if (string.IsNullOrWhiteSpace(html))
+                    continue;
+
+                var context = BrowsingContext.New(config);
+                var doc = await context.OpenAsync(req => req.Content(html).Address(url), ct);
+
+                results.Add((url, doc));
+
+                if (depth >= _opts.MaxDepth)
+                    continue;
+
+                foreach (var next in ExtractInternalLinks(doc, url))
+                {
+                    if (next.Host.Equals(allowedHost, StringComparison.OrdinalIgnoreCase))
+                        queue.Enqueue((next, depth + 1));
+                }
+
+                if (_opts.DelayBetweenRequestsMs > 0)
+                    await Task.Delay(_opts.DelayBetweenRequestsMs, ct);
+            }
+
+            return results;
+        }
+
+        private async Task<string?> GetHtmlWithCaptchaHandlingAsync(Uri url, CancellationToken ct)
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                var res = await _http.SendAsync(req, ct);
+
+                if (!res.IsSuccessStatusCode)
+                    return null;
+
+                var contentType = res.Content.Headers.ContentType?.MediaType ?? "";
+                if (!contentType.Contains("html", StringComparison.OrdinalIgnoreCase) &&
+                    !contentType.Contains("text", StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                var html = await res.Content.ReadAsStringAsync(ct);
+
+                // Detect CAPTCHA
+                if (DetectCaptcha(html))
+                {
+                    _logger?.LogWarning("CAPTCHA detected on {Url}", url);
+
+                    if (_captchaService != null)
+                    {
+                        html = await SolveCaptchaAndRefetchAsync(url, html, ct);
+                    }
+                    else
+                    {
+                        _logger?.LogWarning("CAPTCHA service not available, skipping {Url}", url);
+                        return null;
+                    }
+                }
+
+                return html;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error fetching {Url}", url);
+                return null;
+            }
+        }
+
+        private bool DetectCaptcha(string html)
+        {
+            var captchaIndicators = new[]
+            {
+                "recaptcha",
+                "g-recaptcha",
+                "hcaptcha",
+                "h-captcha",
+                "captcha-challenge",
+                "cloudflare-challenge",
+                "cf-challenge",
+                "captcha_image",
+                "bot-detection"
+            };
+
+            var htmlLower = html.ToLowerInvariant();
+            return captchaIndicators.Any(indicator => htmlLower.Contains(indicator));
+        }
+
+        private async Task<string> SolveCaptchaAndRefetchAsync(Uri url, string html, CancellationToken ct)
+        {
+            try
+            {
+                _logger?.LogInformation("Attempting to solve CAPTCHA for {Url}", url);
+
+                // Extract CAPTCHA site key (reCAPTCHA v2/v3)
+                var siteKey = ExtractRecaptchaSiteKey(html);
+                
+                if (string.IsNullOrEmpty(siteKey))
+                {
+                    _logger?.LogWarning("Could not extract CAPTCHA site key from {Url}", url);
+                    return html;
+                }
+
+                // Solve CAPTCHA
+                var solution = await _captchaService!.SolveRecaptchaV2Async(siteKey, url.ToString());
+                
+                _logger?.LogInformation("CAPTCHA solved successfully for {Url}", url);
+
+                // In a real scenario, you'd need to submit the solution back to the site
+                // For now, we'll retry the fetch (some sites auto-refresh)
+                await Task.Delay(2000, ct);
+                
+                using var retryReq = new HttpRequestMessage(HttpMethod.Get, url);
+                retryReq.Headers.Add("X-Recaptcha-Token", solution);
+                
+                var retryRes = await _http.SendAsync(retryReq, ct);
+                return await retryRes.Content.ReadAsStringAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to solve CAPTCHA for {Url}", url);
+                return html;
+            }
+        }
+
+        private string? ExtractRecaptchaSiteKey(string html)
+        {
+            // Look for: data-sitekey="..." or sitekey:"..."
+            var patterns = new[]
+            {
+                @"data-sitekey=[""']([^""']+)[""']",
+                @"sitekey\s*:\s*[""']([^""']+)[""']",
+                @"grecaptcha\.render\([^,]+,\s*\{\s*sitekey\s*:\s*[""']([^""']+)[""']"
+            };
+
+            foreach (var pattern in patterns)
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(html, pattern);
+                if (match.Success && match.Groups.Count > 1)
+                {
+                    return match.Groups[1].Value;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool LooksLikeBinaryAsset(Uri url)
+        {
+            var path = url.AbsolutePath.ToLowerInvariant();
+            return path.EndsWith(".jpg") || path.EndsWith(".jpeg") || path.EndsWith(".png") ||
+                   path.EndsWith(".webp") || path.EndsWith(".gif") ||
+                   path.EndsWith(".pdf") ||
+                   path.EndsWith(".zip") || path.EndsWith(".rar") ||
+                   path.EndsWith(".mp4") || path.EndsWith(".mp3");
+        }
+
+        private static IEnumerable<Uri> ExtractInternalLinks(IDocument doc, Uri baseUri)
+        {
+            foreach (var a in doc.QuerySelectorAll("a[href]"))
+            {
+                var href = a.GetAttribute("href");
+                if (string.IsNullOrWhiteSpace(href))
+                    continue;
+
+                if (href.StartsWith("#", StringComparison.Ordinal) ||
+                    href.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
+                    href.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase) ||
+                    href.StartsWith("tel:", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (Uri.TryCreate(baseUri, href, out var uri))
+                {
+                    var clean = new UriBuilder(uri) { Fragment = "" }.Uri;
+                    yield return clean;
+                }
+            }
+        }
+    }
+}

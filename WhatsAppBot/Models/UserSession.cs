@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using WhatsAppBot.Models.Flights;
+using WhatsAppBot.Models.Passengers;
 
 namespace WhatsAppBot.Models
 {
@@ -16,10 +17,16 @@ namespace WhatsAppBot.Models
 
         public List<ChatMessage> ConversationHistory { get; set; } = new();
 
-        // ===== Flights =====
+        // ===== Flight Search =====
         public FlightSearchDraft FlightDraft { get; set; } = new();
         public FlightStep FlightStep { get; set; } = FlightStep.None;
         public FlightPricingMode FlightPricingMode { get; set; } = FlightPricingMode.Auto;
+
+        // ===== Booking =====
+        public FlightQuote? CurrentQuote { get; set; }
+        public PassengerInfo PassengerDraft { get; set; } = new();
+        public string? ActiveReservationCode { get; set; }
+        public string? PendingCancellationCode { get; set; }
 
         public void UpdateActivity() => LastActivity = DateTime.UtcNow;
 
@@ -28,6 +35,21 @@ namespace WhatsAppBot.Models
             FlightDraft.Reset();
             FlightStep = FlightStep.None;
             FlightPricingMode = FlightPricingMode.Auto;
+            CurrentQuote = null;
+        }
+
+        public void ResetBookingFlow()
+        {
+            PassengerDraft = new PassengerInfo();
+            ActiveReservationCode = null;
+            CurrentQuote = null;
+        }
+
+        public void ResetAll()
+        {
+            ResetFlightFlow();
+            ResetBookingFlow();
+            PendingCancellationCode = null;
         }
     }
 }

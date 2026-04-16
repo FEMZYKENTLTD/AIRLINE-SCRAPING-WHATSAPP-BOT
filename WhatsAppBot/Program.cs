@@ -11,15 +11,21 @@ using System.Collections.Generic;
 using WhatsAppBot.Data;
 using WhatsAppBot.Extensions;
 using WhatsAppBot.Services;
+using WhatsAppBot.Services.Automation;
+using WhatsAppBot.Services.CaptchaSolver;
 using WhatsAppBot.Services.Implementations;
 using WhatsAppBot.Services.Interfaces;
+using WhatsAppBot.Services.Reservations;
 using WhatsAppBot.Services.Scraping;
 using WhatsAppBot.Services.Flights;
+using WhatsAppBot.Services.Flights.Automations;
 using WhatsAppBot.Models.Flights;
+using WhatsAppBot.Services.Learning;
 
-// Load .env file BEFORE any configuration
+// ─── Load .env FIRST before anything else ───────────────────────────────────
 ConfigurationExtensions.LoadDotEnv();
 
+// ─── Serilog bootstrap ───────────────────────────────────────────────────────
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
     .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
@@ -34,91 +40,117 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     Log.Information("===========================================");
-    Log.Information("Starting WhatsApp Bot...");
+    Log.Information("  FEMZYK ENTERPRISES - Travel Bot v2.0   ");
     Log.Information("===========================================");
 
     var builder = WebApplication.CreateBuilder(args);
     builder.Host.UseSerilog();
 
-    // Override appsettings with environment variables
+    // ─── Merge env vars into configuration ───────────────────────────────────
     builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
     {
-        ["MetaWhatsApp:GraphBase"] = Environment.GetEnvironmentVariable("WHATSAPP_GRAPH_BASE") ?? builder.Configuration["MetaWhatsApp:GraphBase"],
-        ["MetaWhatsApp:ApiVersion"] = Environment.GetEnvironmentVariable("WHATSAPP_API_VERSION") ?? builder.Configuration["MetaWhatsApp:ApiVersion"],
-        ["MetaWhatsApp:PhoneNumberId"] = Environment.GetEnvironmentVariable("WHATSAPP_PHONE_NUMBER_ID") ?? builder.Configuration["MetaWhatsApp:PhoneNumberId"],
-        ["MetaWhatsApp:AccessToken"] = Environment.GetEnvironmentVariable("WHATSAPP_ACCESS_TOKEN") ?? builder.Configuration["MetaWhatsApp:AccessToken"],
-        ["MetaWhatsApp:VerifyToken"] = Environment.GetEnvironmentVariable("WHATSAPP_VERIFY_TOKEN") ?? builder.Configuration["MetaWhatsApp:VerifyToken"],
-        ["MetaWhatsApp:AppSecret"] = Environment.GetEnvironmentVariable("WHATSAPP_APP_SECRET") ?? builder.Configuration["MetaWhatsApp:AppSecret"],
-        
-        ["AzureOpenAI:Endpoint"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT") ?? builder.Configuration["AzureOpenAI:Endpoint"],
-        ["AzureOpenAI:Deployment"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT") ?? builder.Configuration["AzureOpenAI:Deployment"],
-        ["AzureOpenAI:ApiKey"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY") ?? builder.Configuration["AzureOpenAI:ApiKey"],
-        ["AzureOpenAI:ApiVersion"] = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION") ?? builder.Configuration["AzureOpenAI:ApiVersion"],
-        
-        ["FlightPricing:AmadeusClientId"] = Environment.GetEnvironmentVariable("AMADEUS_CLIENT_ID") ?? builder.Configuration["FlightPricing:AmadeusClientId"],
-        ["FlightPricing:AmadeusClientSecret"] = Environment.GetEnvironmentVariable("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["FlightPricing:AmadeusClientSecret"],
-        
-        ["CaptchaService:ApiKey"] = Environment.GetEnvironmentVariable("CAPTCHA_API_KEY") ?? string.Empty,
-        ["CaptchaService:Provider"] = Environment.GetEnvironmentVariable("CAPTCHA_SERVICE_PROVIDER") ?? "2captcha",
-        
-        ["ConnectionStrings:DefaultConnection"] = Environment.GetEnvironmentVariable("DATABASE_CONNECTION_STRING") ?? "Data Source=whatsappbot.db"
+        // WhatsApp
+        ["MetaWhatsApp:GraphBase"] = Env("WHATSAPP_GRAPH_BASE") ?? builder.Configuration["MetaWhatsApp:GraphBase"],
+        ["MetaWhatsApp:ApiVersion"] = Env("WHATSAPP_API_VERSION") ?? builder.Configuration["MetaWhatsApp:ApiVersion"],
+        ["MetaWhatsApp:PhoneNumberId"] = Env("WHATSAPP_PHONE_NUMBER_ID") ?? builder.Configuration["MetaWhatsApp:PhoneNumberId"],
+        ["MetaWhatsApp:AccessToken"] = Env("WHATSAPP_ACCESS_TOKEN") ?? builder.Configuration["MetaWhatsApp:AccessToken"],
+        ["MetaWhatsApp:VerifyToken"] = Env("WHATSAPP_VERIFY_TOKEN") ?? builder.Configuration["MetaWhatsApp:VerifyToken"],
+        ["MetaWhatsApp:AppSecret"] = Env("WHATSAPP_APP_SECRET") ?? builder.Configuration["MetaWhatsApp:AppSecret"],
+
+        // Azure OpenAI
+        ["AzureOpenAI:Endpoint"] = Env("AZURE_OPENAI_ENDPOINT") ?? builder.Configuration["AzureOpenAI:Endpoint"],
+        ["AzureOpenAI:Deployment"] = Env("AZURE_OPENAI_DEPLOYMENT") ?? builder.Configuration["AzureOpenAI:Deployment"],
+        ["AzureOpenAI:ApiKey"] = Env("AZURE_OPENAI_API_KEY") ?? builder.Configuration["AzureOpenAI:ApiKey"],
+        ["AzureOpenAI:ApiVersion"] = Env("AZURE_OPENAI_API_VERSION") ?? builder.Configuration["AzureOpenAI:ApiVersion"],
+
+        // Amadeus
+        ["FlightPricing:AmadeusClientId"] = Env("AMADEUS_CLIENT_ID") ?? builder.Configuration["FlightPricing:AmadeusClientId"],
+        ["FlightPricing:AmadeusClientSecret"] = Env("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["FlightPricing:AmadeusClientSecret"],
+        ["FlightPricing:AmadeusBaseUrl"] = Env("AMADEUS_BASE_URL") ?? builder.Configuration["FlightPricing:AmadeusBaseUrl"],
+
+        // CAPTCHA
+        ["CaptchaService:ApiKey"] = Env("CAPTCHA_API_KEY") ?? string.Empty,
+        ["CaptchaService:Provider"] = Env("CAPTCHA_SERVICE_PROVIDER") ?? "self",
+
+        // Stripe
+        ["Stripe:SecretKey"] = Env("STRIPE_SECRET_KEY") ?? string.Empty,
+        ["Stripe:PublishableKey"] = Env("STRIPE_PUBLISHABLE_KEY") ?? string.Empty,
+        ["Stripe:WebhookSecret"] = Env("STRIPE_WEBHOOK_SECRET") ?? string.Empty,
+
+        // Azure Speech
+        ["AzureSpeech:Key"] = Env("AZURE_SPEECH_KEY") ?? string.Empty,
+        ["AzureSpeech:Region"] = Env("AZURE_SPEECH_REGION") ?? "eastus",
+
+        // DB
+        ["ConnectionStrings:DefaultConnection"] = Env("DATABASE_CONNECTION_STRING") ?? "Data Source=whatsappbot.db",
+
+        // Bot personality
+        ["Bot:Name"] = Env("BOT_NAME") ?? "Femzyk_Aje_Bot",
+        ["Bot:Company"] = Env("BOT_COMPANY") ?? "FEMZYK ENTERPRISES LTD",
+        ["Bot:SupportEmail"] = Env("BOT_SUPPORT_EMAIL") ?? "femzykenterprisesltd@gmail.com",
     });
 
+    // ─── Infrastructure ──────────────────────────────────────────────────────
     builder.Services.AddControllers();
-
-    // HttpClientFactory (Meta sending + external calls)
     builder.Services.AddHttpClient();
     builder.Services.AddMemoryCache();
 
-    // DB
-    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") ?? "Data Source=whatsappbot.db";
-    builder.Services.AddDbContext<AppDbContext>(options =>
-        options.UseSqlite(connectionString));
+    // ─── Database ────────────────────────────────────────────────────────────
+    var connStr = builder.Configuration.GetConnectionString("DefaultConnection")
+                  ?? "Data Source=whatsappbot.db";
+    builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlite(connStr));
 
-    // Scraping config
+    // ─── Scraping configuration ───────────────────────────────────────────────
     var scrapingSection = builder.Configuration.GetSection("Scraping");
     builder.Services.Configure<ScrapingOptions>(scrapingSection);
 
-    // Core bot services
+    // ─── Core bot services ───────────────────────────────────────────────────
     builder.Services.AddSingleton<ISessionService, InMemorySessionService>();
     builder.Services.AddScoped<ILLMService, AzureOpenAiService>();
     builder.Services.AddSingleton<IWhatsAppService, MetaWhatsAppService>();
     builder.Services.AddScoped<IChatLogService, ChatLogService>();
-
-    // Catalog DB query services
     builder.Services.AddScoped<IProductCatalogService, ProductCatalogService>();
-
-    // Sync engine
     builder.Services.AddScoped<ICatalogSyncService, CatalogSyncService>();
 
-    // CAPTCHA Service
+    // ─── CAPTCHA & Automation ─────────────────────────────────────────────────
     builder.Services.AddScoped<ICaptchaService, CaptchaService>();
+    builder.Services.AddSingleton<SelfCaptchaSolver>();
+    builder.Services.AddSingleton<ProxyManager>();
+    builder.Services.AddSingleton<StealthBrowserManager>();
+    builder.Services.AddSingleton<BookingOrchestrator>();
 
-    // Background workers
+    // ─── Reservation & Payment ────────────────────────────────────────────────
+    builder.Services.AddScoped<IReservationService, ReservationService>();
+
+    // ─── Per-airline automation classes ───────────────────────────────────────
+    builder.Services.AddSingleton<IFlightBookingAutomation, TurkishAirlinesAutomation>();
+    builder.Services.AddSingleton<IFlightBookingAutomation, LufthansaAutomation>();
+    builder.Services.AddSingleton<IFlightBookingAutomation, AirPeaceAutomation>();
+    builder.Services.AddSingleton<IFlightBookingAutomation, ArikAirAutomation>();
+
+    // ─── Background workers ───────────────────────────────────────────────────
     builder.Services.AddHostedService<SessionCleanupService>();
     builder.Services.AddHostedService<CatalogSyncHostedService>();
 
-    // ===== Flight Pricing =====
+    // ─── Flight pricing ───────────────────────────────────────────────────────
     builder.Services.Configure<FlightPricingOptions>(builder.Configuration.GetSection("FlightPricing"));
     builder.Services.Configure<AmadeusOptions>(builder.Configuration.GetSection("Amadeus"));
-
     builder.Services.AddScoped<FlightPricingService>();
-
-    // Self-hosted CAPTCHA solver (FREE!)
-    builder.Services.AddSingleton<SelfCaptchaSolver>();
-
     builder.Services.AddHttpClient<AmadeusFlightPricingProvider>();
     builder.Services.AddScoped<IFlightPricingProvider, AmadeusFlightPricingProvider>();
-
     builder.Services.AddScoped<IFlightPricingProvider, DeepLinkFlightPricingProvider>();
 
-    // ===== Register one scraper per airline =====
-    var scrapingOptPreview = scrapingSection.Get<ScrapingOptions>() ?? new ScrapingOptions();
-    var airlines = scrapingOptPreview.Airlines ?? new List<AirlineTarget>();
+    // ─── Learning & Knowledge System ──────────────────────────────────────────
+    builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
+    builder.Services.AddScoped<IKnowledgeService, KnowledgeService>();
+
+    // ─── Airline scrapers (one per configured airline) ────────────────────────
+    var scrapingOpts = scrapingSection.Get<ScrapingOptions>() ?? new ScrapingOptions();
+    var airlines = scrapingOpts.Airlines ?? new List<AirlineTarget>();
 
     if (airlines.Count == 0)
     {
-        Log.Warning("No airlines configured under Scraping:Airlines. Scraping will not run.");
+        Log.Warning("No airlines configured under Scraping:Airlines.");
     }
     else
     {
@@ -132,27 +164,41 @@ try
                 return new AirlineProductScraper(http, logger, options, airline);
             });
         }
+        Log.Information("Registered {Count} airline scrapers", airlines.Count);
     }
 
+    // ─── Build app ────────────────────────────────────────────────────────────
     var app = builder.Build();
 
-    // Ensure DB created (prototype mode)
+    // Ensure DB schema is created
     using (var scope = app.Services.CreateScope())
     {
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         db.Database.EnsureCreated();
-        Log.Information("Database initialized successfully");
+        Log.Information("Database ready: {ConnStr}", connStr);
     }
 
     app.UseSerilogRequestLogging();
     app.MapControllers();
 
+    // Health endpoint
     app.MapGet("/", () => new
     {
-        service = "WhatsApp Bot",
+        service = "FEMZYK ENTERPRISES - WhatsApp Travel Bot",
+        version = "2.0",
         status = "Running",
         timestamp = DateTime.UtcNow,
-        version = "2.0",
+        features = new[]
+        {
+            "AI Chat (Azure OpenAI)",
+            "Flight Search (Amadeus + Scraping)",
+            "Flight Booking (API + Automation)",
+            "Reservation Management",
+            "Cancellation Engine",
+            "CAPTCHA Bypass (Self-hosted)",
+            "IP Rotation",
+            "Product Catalog"
+        },
         endpoints = new
         {
             webhook = "/webhook",
@@ -160,10 +206,10 @@ try
         }
     });
 
-    Log.Information("WhatsApp Bot is ready!");
-    Log.Information("Webhook URL: http://localhost:5260/webhook");
-    Log.Information("Alt Webhook URL: http://localhost:5260/api/webhook");
-    Log.Information("Environment: {Env}", builder.Environment.EnvironmentName);
+    Log.Information("Bot Name    : {Name}", builder.Configuration["Bot:Name"]);
+    Log.Information("Company     : {Company}", builder.Configuration["Bot:Company"]);
+    Log.Information("Webhook     : http://localhost:5260/webhook");
+    Log.Information("Alt Webhook : http://localhost:5260/api/webhook");
     Log.Information("===========================================");
 
     app.Run();
@@ -177,3 +223,7 @@ finally
 {
     Log.CloseAndFlush();
 }
+
+// ─── Helper ──────────────────────────────────────────────────────────────────
+static string? Env(string key) =>
+    Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : null;
