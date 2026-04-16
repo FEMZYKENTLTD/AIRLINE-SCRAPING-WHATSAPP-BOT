@@ -39,6 +39,8 @@ namespace WhatsAppBot.Controllers
         private readonly ScrapingOptions _scrapingOpt;
         private readonly ILogger<WhatsAppWebhookController> _logger;
         private readonly IConfiguration _config;
+        private readonly IImageGenerationService _imageService;
+        private readonly IVisionService _visionService;
 
         // ── Constants ─────────────────────────────────────────────────────
         private static readonly HashSet<string> GreetingSet = new(
@@ -75,6 +77,8 @@ namespace WhatsAppBot.Controllers
             _scrapingOpt = scrapingOptions.Value;
             _logger = logger;
             _config = config;
+            _imageService = imageService;
+            _visionService = visionService;
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -408,6 +412,33 @@ _Powered by Azure OpenAI + Live Data_";
             {
                 _session.RemoveSession(session.PhoneNumber);
                 return "🔄 Your session has been reset.\n\nSend any message to start over!";
+            }
+
+            // ── /image — Generate image from prompt ─────────────────────────────
+            if (lower.StartsWith("/image ") || lower.StartsWith("/generate "))
+            {
+                var featureEnabled = _config["FEATURE_IMAGE_GENERATION"] == "true" ||
+                                     Environment.GetEnvironmentVariable("FEATURE_IMAGE_GENERATION") == "true";
+
+                if (!featureEnabled)
+                    return "🎨 Image generation is not enabled. Contact admin.";
+
+                var prompt = text.Contains(' ') ? text[(text.IndexOf(' ') + 1)..].Trim() : "";
+                if (prompt.Length < 3)
+                    return "Please describe what image you want.\nExample: */image a sunset over Lagos Nigeria*";
+
+                await _whatsApp.SendMessageAsync(session.PhoneNumber,
+                    "🎨 Generating your image... Please wait (this takes 10-20 seconds)");
+
+                var result = await _imageService.GenerateImageAsync(prompt, ct: HttpContext.RequestAborted);
+
+                if (result.Success && !string.IsNullOrWhiteSpace(result.ImageUrl))
+                {
+                    await _whatsApp.SendImageAsync(session.PhoneNumber, result.ImageUrl, prompt);
+                    return $"✅ Image generated! _(Model: {result.ModelUsed})_";
+                }
+
+                return "😕 Could not generate image. Please try a different prompt.";
             }
 
             // ── Cancel active flight search ──────────────────────────────

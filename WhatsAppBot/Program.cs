@@ -21,6 +21,7 @@ using WhatsAppBot.Services.Flights;
 using WhatsAppBot.Services.Flights.Automations;
 using WhatsAppBot.Models.Flights;
 using WhatsAppBot.Services.Learning;
+using WhatsAppBot.Services.Media;
 
 // ─── Load .env FIRST before anything else ───────────────────────────────────
 ConfigurationExtensions.LoadDotEnv();
@@ -143,6 +144,11 @@ try
     // ─── Learning & Knowledge System ──────────────────────────────────────────
     builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
     builder.Services.AddScoped<IKnowledgeService, KnowledgeService>();
+
+    // ─── Media Services (Image, Voice, Vision) ───────────────────────────────────
+    builder.Services.AddScoped<IImageGenerationService, ImageGenerationService>();
+    builder.Services.AddScoped<IVoiceService, VoiceService>();
+    builder.Services.AddScoped<IVisionService, VisionService>();
 
     // ─── Airline scrapers (one per configured airline) ────────────────────────
     var scrapingOpts = scrapingSection.Get<ScrapingOptions>() ?? new ScrapingOptions();
