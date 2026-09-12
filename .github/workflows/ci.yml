@@ -203,7 +203,11 @@ jobs:
 
       - name: Save container logs (evidence)
         if: always()
-        run: docker logs platform-smoke > smoke-container-logs.txt 2>&1 || { echo "warning: could not capture container logs"; docker ps -a; true; }
+        run: |
+          if ! docker logs platform-smoke > smoke-container-logs.txt 2>&1; then
+            echo "warning: could not capture container logs"
+            docker ps -a
+          fi
 
       - name: Stop container
         if: always()
