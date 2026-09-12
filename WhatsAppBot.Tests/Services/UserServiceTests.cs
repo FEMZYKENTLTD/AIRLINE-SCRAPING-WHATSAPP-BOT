@@ -35,7 +35,7 @@ namespace WhatsAppBot.Tests.Services
         [Fact]
         public async Task FindOrCreateByChannel_CreatesNewUser_WhenNotExists()
         {
-            var (user, identity) = await _service.FindOrCreateByChannelAsync(
+            var (user, identity, _created) = await _service.FindOrCreateByChannelAsync(
                 "whatsapp", "2348012345678", "John Doe");
 
             user.Should().NotBeNull();
@@ -50,10 +50,10 @@ namespace WhatsAppBot.Tests.Services
         [Fact]
         public async Task FindOrCreateByChannel_FindsExistingUser_WhenExists()
         {
-            var (user1, _) = await _service.FindOrCreateByChannelAsync(
+            var (user1, _, _) = await _service.FindOrCreateByChannelAsync(
                 "whatsapp", "2348012345678", "John Doe");
 
-            var (user2, identity2) = await _service.FindOrCreateByChannelAsync(
+            var (user2, identity2, _) = await _service.FindOrCreateByChannelAsync(
                 "whatsapp", "2348012345678", "John Updated");
 
             user2.Id.Should().Be(user1.Id); // Same user
@@ -63,11 +63,11 @@ namespace WhatsAppBot.Tests.Services
         [Fact]
         public async Task FindOrCreateByChannel_SameUserDifferentChannels()
         {
-            var (user1, _) = await _service.FindOrCreateByChannelAsync(
+            var (user1, _, _) = await _service.FindOrCreateByChannelAsync(
                 "whatsapp", "2348012345678", "John");
 
             // Different channel, different provider ID = new user
-            var (user2, _) = await _service.FindOrCreateByChannelAsync(
+            var (user2, _, _) = await _service.FindOrCreateByChannelAsync(
                 "telegram", "987654", "John");
 
             user2.Id.Should().NotBe(user1.Id); // Different internal users
@@ -76,7 +76,7 @@ namespace WhatsAppBot.Tests.Services
         [Fact]
         public async Task UpdateProfile_UpdatesFields()
         {
-            var (user, _) = await _service.FindOrCreateByChannelAsync(
+            var (user, _, _) = await _service.FindOrCreateByChannelAsync(
                 "whatsapp", "2348012345678", "John");
 
             var updated = await _service.UpdateProfileAsync(user.Id, "Jane Doe", "jane@example.com");

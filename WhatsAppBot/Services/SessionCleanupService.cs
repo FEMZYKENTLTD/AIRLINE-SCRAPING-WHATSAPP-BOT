@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
@@ -9,6 +9,11 @@ using WhatsAppBot.Services.Interfaces;
 
 namespace WhatsAppBot.Services
 {
+    /// <summary>
+    /// Periodically marks database-backed sessions as expired when they have
+    /// exceeded the inactivity timeout (default 7 days). Uses the persistent
+    /// session store so expiry survives application restarts.
+    /// </summary>
     public class SessionCleanupService : BackgroundService
     {
         private readonly IServiceProvider _services;
@@ -23,8 +28,9 @@ namespace WhatsAppBot.Services
         {
             _services = services;
             _logger = logger;
-            _cleanupInterval = TimeSpan.FromMinutes(config.GetValue<int>("Session:CleanupIntervalMinutes", 5));
-            _sessionTimeout = TimeSpan.FromMinutes(config.GetValue<int>("Session:TimeoutMinutes", 30));
+            _cleanupInterval = TimeSpan.FromMinutes(config.GetValue<int>("Session:CleanupIntervalMinutes", 60));
+            // 7-day inactivity expiry by default (10080 minutes)
+            _sessionTimeout = TimeSpan.FromMinutes(config.GetValue<int>("Session:TimeoutMinutes", 10080));
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -41,8 +47,11 @@ namespace WhatsAppBot.Services
                     await Task.Delay(_cleanupInterval, stoppingToken);
 
                     using var scope = _services.CreateScope();
-                    var sessionService = scope.ServiceProvider.GetRequiredService<ISessionService>();
-                    sessionService.CleanupExpiredSessions(_sessionTimeout);
+                    var sessionService = scope.ServiceProvider.GetRequiredService<IPersistentSessionService>();
+                    var cleaned = await sessionService.CleanupExpiredSessionsAsync(stoppingToken);
+
+                    if (cleaned > 0)
+                        _logger.LogInformation("Session cleanup: marked {Count} expired session(s)", cleaned);
                 }
                 catch (OperationCanceledException)
                 {

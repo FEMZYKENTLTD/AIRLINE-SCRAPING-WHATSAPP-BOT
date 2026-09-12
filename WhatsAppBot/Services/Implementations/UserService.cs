@@ -22,9 +22,14 @@ namespace WhatsAppBot.Services.Implementations
             _logger = logger;
         }
 
-        public async Task<(User User, ChannelIdentity Identity)> FindOrCreateByChannelAsync(
+        public async Task<(User User, ChannelIdentity Identity, bool Created)> FindOrCreateByChannelAsync(
             string channel, string providerUserId, string? displayName, CancellationToken ct = default)
         {
+            if (string.IsNullOrWhiteSpace(providerUserId))
+                throw new ArgumentException("providerUserId is required", nameof(providerUserId));
+            if (string.IsNullOrWhiteSpace(channel))
+                throw new ArgumentException("channel is required", nameof(channel));
+
             // Try to find existing channel identity
             var identity = await _db.ChannelIdentities
                 .Include(ci => ci.User)
@@ -42,10 +47,11 @@ namespace WhatsAppBot.Services.Implementations
                 _logger.LogDebug("Found existing user {UserId} via {Channel}:{ProviderUserId}",
                     identity.UserId, channel, providerUserId);
 
-                return (identity.User, identity);
+                return (identity.User, identity, false);
             }
 
-            // Create new user and channel identity
+            // Create new user and channel identity (unique index on
+            // Channel+ProviderUserId protects against concurrent duplicates)
             var user = new User
             {
                 DisplayName = displayName,
@@ -74,7 +80,7 @@ namespace WhatsAppBot.Services.Implementations
             _logger.LogInformation("Created new user {UserId} via {Channel}:{ProviderUserId}",
                 user.Id, channel, providerUserId);
 
-            return (user, identity);
+            return (user, identity, true);
         }
 
         public async Task<User?> GetByIdAsync(int userId, CancellationToken ct = default)

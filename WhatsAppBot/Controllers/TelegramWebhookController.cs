@@ -1,18 +1,26 @@
 using System;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using WhatsAppBot.Models;
+using WhatsAppBot.Models.Flights;
+using WhatsAppBot.Services.Flights;
 using WhatsAppBot.Services.Interfaces;
 
 namespace WhatsAppBot.Controllers
 {
     /// <summary>
     /// Handles incoming Telegram Bot API webhook updates.
-    /// Uses the same underlying business logic as WhatsApp through shared services.
+    ///
+    /// Uses the SAME shared application services as the WhatsApp channel
+    /// (User / PersistentSession / Conversation / ServiceRequest / Audit /
+    /// IntentRouter / FlightConversation / LLM). Business rules are
+    /// centralized — this adapter only does Telegram parsing/presentation.
     /// </summary>
     [ApiController]
     [Route("telegram")]
@@ -26,10 +34,15 @@ namespace WhatsAppBot.Controllers
         private readonly IServiceRequestService _serviceRequestService;
         private readonly ILLMService _llm;
         private readonly IAuditService _auditService;
+        private readonly IIntentRouter _intentRouter;
+        private readonly FlightConversationService _flightConversation;
         private readonly IConfiguration _config;
         private readonly ILogger<TelegramWebhookController> _logger;
 
         private const string Channel = "telegram";
+
+        [GeneratedRegex(@"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")]
+        private static partial Regex EmailRegex();
 
         public TelegramWebhookController(
             ITelegramService telegram,
@@ -39,6 +52,8 @@ namespace WhatsAppBot.Controllers
             IServiceRequestService serviceRequestService,
             ILLMService llm,
             IAuditService auditService,
+            IIntentRouter intentRouter,
+            FlightConversationService flightConversation,
             IConfiguration config,
             ILogger<TelegramWebhookController> logger)
         {
@@ -49,13 +64,15 @@ namespace WhatsAppBot.Controllers
             _serviceRequestService = serviceRequestService;
             _llm = llm;
             _auditService = auditService;
+            _intentRouter = intentRouter;
+            _flightConversation = flightConversation;
             _config = config;
             _logger = logger;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // TELEGRAM WEBHOOK ENDPOINT
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         [HttpPost]
         public async Task<IActionResult> Receive()
         {
@@ -65,6 +82,12 @@ namespace WhatsAppBot.Controllers
                 if (!VerifyWebhookSecret())
                 {
                     _logger.LogWarning("Telegram webhook secret verification failed");
+                    await _auditService.LogAsync(
+                        "WEBHOOK_REJECTED", "Webhook", null,
+                        actorId: "system", channel: Channel,
+                        details: "Invalid X-Telegram-Bot-Api-Secret-Token",
+                        ipAddress: HttpContext.Connection.RemoteIpAddress?.ToString(),
+                        ct: HttpContext.RequestAborted);
                     return Unauthorized();
                 }
 
@@ -82,17 +105,14 @@ namespace WhatsAppBot.Controllers
                 using var doc = JsonDocument.Parse(rawBody);
                 var root = doc.RootElement;
 
-                // Extract update_id for idempotency
-                var updateId = root.TryGetProperty("update_id", out var uid) ? uid.GetInt64() : 0;
-
-                // Process message
+                // ── Message update ──────────────────────────────────────────
                 if (root.TryGetProperty("message", out var message))
                 {
-                    await ProcessMessageAsync(message, updateId);
+                    await ProcessMessageAsync(message);
                 }
                 else if (root.TryGetProperty("callback_query", out var callback))
                 {
-                    await ProcessCallbackQueryAsync(callback, updateId);
+                    await ProcessCallbackQueryAsync(callback);
                 }
 
                 return Ok();
@@ -104,11 +124,13 @@ namespace WhatsAppBot.Controllers
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // MESSAGE PROCESSING
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task ProcessMessageAsync(JsonElement message, long updateId)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task ProcessMessageAsync(JsonElement message)
         {
+            var ct = HttpContext.RequestAborted;
+
             // Extract chat and user info
             var chatId = message.GetProperty("chat").GetProperty("id").GetInt64().ToString();
             var chatType = message.GetProperty("chat").GetProperty("type").GetString() ?? "private";
@@ -134,91 +156,135 @@ namespace WhatsAppBot.Controllers
                 messageText = textElement.GetString() ?? string.Empty;
             }
 
+            messageText = messageText.Trim();
             if (string.IsNullOrWhiteSpace(messageText))
             {
                 _logger.LogDebug("Ignoring non-text Telegram message from {UserId}", userId);
                 return;
             }
 
-            _logger.LogInformation("📨 Telegram message from {UserId} ({Name}): {Preview}",
+            _logger.LogInformation("Telegram message from {UserId} ({Name}): {Preview}",
                 userId, displayName,
                 messageText.Length > 60 ? $"{messageText[..60]}..." : messageText);
 
-            // Find or create user
-            var (user, identity) = await _userService.FindOrCreateByChannelAsync(
-                Channel, userId, displayName);
+            // ── Idempotency: same update/message twice → one business action ─
+            if (!string.IsNullOrWhiteSpace(providerMessageId) &&
+                await _conversationService.ExistsByProviderMessageIdAsync(providerMessageId, ct))
+            {
+                _logger.LogWarning("Duplicate Telegram message ignored: {MsgId}", providerMessageId);
+                await _auditService.LogAsync(
+                    "WEBHOOK_DUPLICATE", "Message", providerMessageId,
+                    actorId: "system", channel: Channel,
+                    details: $"provider user {userId}",
+                    ct: ct);
+                return;
+            }
+
+            // Find or create user (shared user across channels)
+            var (user, _identity, created) = await _userService.FindOrCreateByChannelAsync(
+                Channel, userId, displayName, ct);
+
+            if (created)
+            {
+                await _auditService.LogAsync(
+                    "USER_CREATED", "User", user.Id.ToString(),
+                    actorId: "system", channel: Channel,
+                    details: $"provider user {userId}",
+                    ct: ct);
+            }
 
             // Get or create persistent session
             var session = await _sessionService.GetOrCreateSessionAsync(
-                Channel, userId, user.Id);
+                Channel, userId, user.Id, ct);
 
-            // Log inbound message (with idempotency)
-            await _conversationService.LogInboundAsync(
+            // Log inbound message (shared message store)
+            var inbound = await _conversationService.LogInboundAsync(
                 Channel, userId, messageText, providerMessageId,
-                session.Id, user.Id);
+                session.Id, user.Id, ct: ct);
 
-            // Process the message and generate response
-            var replyText = await ProcessCommandAsync(session, user, messageText);
+            await _auditService.LogAsync(
+                "WEBHOOK_RECEIVED", "Message", inbound.Id.ToString(),
+                actorId: userId, channel: Channel,
+                details: "inbound message",
+                ipAddress: HttpContext.Connection.RemoteIpAddress?.ToString(),
+                ct: ct);
+
+            // Restore persisted flow state (same FlowContext as WhatsApp)
+            var flow = FlowContext.FromJson(session.ContextData);
+            var working = flow.ToUserSession(user.PhoneNumber ?? $"tg_{user.Id}");
+            working.Name = user.DisplayName;
+            working.Email = user.Email;
+
+            // Process the message and generate response (shared business rules)
+            var replyText = await ProcessCommandAsync(session, user, working, messageText, ct);
 
             if (!string.IsNullOrWhiteSpace(replyText))
             {
-                await _telegram.SendMessageAsync(chatId, replyText);
+                await _telegram.SendMessageAsync(chatId, replyText, ct);
 
                 await _conversationService.LogOutboundAsync(
-                    Channel, userId, replyText, session.Id, user.Id);
+                    Channel, userId, replyText, session.Id, user.Id, ct: ct);
             }
 
-            // Update session
-            await _sessionService.UpdateSessionAsync(session);
+            // Persist updated flow state (mirrors WhatsApp behaviour)
+            await PersistFlowAsync(session, working, user, ct);
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // COMMAND PROCESSING (shared logic with WhatsApp)
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task<string> ProcessCommandAsync(AppSession session, User user, string messageText)
+        // ═══════════════════════════════════════════════════════════════════════
+        // COMMAND PROCESSING (shared logic with WhatsApp — same state machine)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task<string> ProcessCommandAsync(
+            AppSession session, User user, UserSession working, string messageText, CancellationToken ct)
         {
             var text = (messageText ?? "").Trim();
             var lower = text.ToLowerInvariant();
 
-            // Handle based on current session state
-            switch (session.CurrentState)
+            // ── Active free-text flight conversation (shared flight service) ─
+            if (working.ConversationFlightStep != FlightConversationStep.None)
             {
-                case "New":
-                    session.CurrentState = "Onboarding_Name";
-                    await _sessionService.UpdateSessionAsync(session);
-                    return $"👋 Welcome! I'm your AI travel assistant.\n\nPlease reply with your *full name* to get started.";
+                return await _flightConversation.HandleAsync(working, text, ct);
+            }
 
-                case "Onboarding_Name":
+            // ── Onboarding (same state names as WhatsApp) ──────────────────
+            switch (working.State)
+            {
+                case UserState.New:
+                    working.State = UserState.AwaitingName;
+                    return "👋 Welcome! I'm your AI travel assistant.\n\nPlease reply with your *full name* to get started.";
+
+                case UserState.AwaitingName:
                     if (text.Length < 2)
                         return "Please enter a valid name (at least 2 characters).";
+                    if (text.Length > 100)
+                        return "That name is too long. Please enter a shorter name.";
 
-                    await _userService.UpdateProfileAsync(user.Id, text, null);
-                    session.CurrentState = "Onboarding_Email";
-                    await _sessionService.UpdateSessionAsync(session);
+                    await _userService.UpdateProfileAsync(user.Id, text, null, ct);
+                    working.Name = text;
+                    working.State = UserState.AwaitingEmail;
                     return $"Nice to meet you, *{text}*! 🎉\n\nNow, please enter your *email address*.";
 
-                case "Onboarding_Email":
-                    if (!System.Text.RegularExpressions.Regex.IsMatch(text, @"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"))
+                case UserState.AwaitingEmail:
+                    if (!EmailRegex().IsMatch(text))
                         return "That doesn't look like a valid email. Please try again.";
 
-                    await _userService.UpdateProfileAsync(user.Id, null, text.ToLowerInvariant());
-                    session.CurrentState = "Verified";
-                    await _sessionService.UpdateSessionAsync(session);
+                    await _userService.UpdateProfileAsync(user.Id, null, text.ToLowerInvariant(), ct);
+                    working.Email = text.ToLowerInvariant();
+                    working.State = UserState.Verified;
 
-                    return $"✅ *You're all set!*\n\n" +
+                    return "✅ *You're all set!*\n\n" +
                            "Here's what I can do:\n\n" +
                            "✈️ */flight* — Search & book flights\n" +
                            "📋 */mybookings* — View reservations\n" +
                            "🛍️ */products* — Browse products\n" +
                            "💬 Just type anything to chat with AI!\n" +
+                           "🆘 */agent* — Escalate to a human agent\n" +
                            "🆘 */help* — Full command list";
             }
 
-            // ── Handle commands for verified users ──────────────────────
+            // ── Handle commands for verified users ──────────────────────────
             if (lower is "/start")
             {
-                session.CurrentState = "New";
-                await _sessionService.UpdateSessionAsync(session);
+                working.State = UserState.New;
                 return "👋 Welcome back! Send any message to get started.";
             }
 
@@ -234,10 +300,12 @@ namespace WhatsAppBot.Controllers
                        "• */products* — Browse catalog\n" +
                        "• */search <keyword>* — Search items\n\n" +
                        "💬 *AI*\n" +
-                       "• Type anything for AI assistance\n\n" +
+                       "• Type anything for AI assistance\n" +
+                       "• \"I want a flight from LOS to LHR\" starts a search\n\n" +
                        "⚙️ *ACCOUNT*\n" +
                        "• */status* — Your profile\n" +
                        "• */reset* — Start fresh\n" +
+                       "• */agent* — Escalate to a human agent\n" +
                        "• */help* — This menu";
             }
 
@@ -248,36 +316,34 @@ namespace WhatsAppBot.Controllers
                        $"📧 Email: {user.Email}\n" +
                        $"📱 Channel: Telegram\n" +
                        $"🕐 Session: {session.CreatedAtUtc:MMM dd, yyyy HH:mm} UTC\n" +
-                       $"✈️ State: {session.CurrentState}";
+                       $"✈️ State: {working.State}";
             }
 
             if (lower is "/reset" or "/restart")
             {
-                session.CurrentState = "Verified";
-                session.WorkflowStep = null;
-                session.ContextData = null;
-                await _sessionService.UpdateSessionAsync(session);
+                working.State = UserState.New;
+                working.ResetAll();
+                working.Name = null;
+                working.Email = null;
                 return "🔄 Session reset!\n\nSend any message to start over.";
             }
 
             if (lower is "/cancel")
             {
-                session.CurrentState = "Verified";
-                session.WorkflowStep = null;
-                await _sessionService.UpdateSessionAsync(session);
+                working.ConversationFlightStep = FlightConversationStep.None;
+                working.ResetAll();
                 return "❌ Current action cancelled.\n\nType */help* to see what I can do.";
             }
 
-            if (lower is "/agent")
+            if (lower is "/agent" or "/human" or "/support" or "/escalate")
             {
-                // Escalate to human
                 var sr = await _serviceRequestService.CreateAsync(
                     "HumanEscalation", Channel, user.Id, session.Id,
-                    "User requested human agent via Telegram");
+                    "User requested human agent via Telegram", ct);
 
-                await _serviceRequestService.EscalateAsync(sr.RequestCode, "User requested agent");
-                await _auditService.LogAsync("HumanEscalation", "ServiceRequest", sr.RequestCode,
-                    user.Id.ToString(), Channel);
+                await _serviceRequestService.EscalateAsync(sr.RequestCode, "User requested agent", ct: ct);
+                await _auditService.LogAsync("SERVICE_REQUEST_ESCALATED", "ServiceRequest", sr.RequestCode,
+                    user.Id.ToString(), Channel, details: "User requested agent via /agent", ct: ct);
 
                 return "🆘 I've flagged your request for a human agent.\n\n" +
                        $"Reference: *{sr.RequestCode}*\n\n" +
@@ -286,12 +352,16 @@ namespace WhatsAppBot.Controllers
 
             if (lower is "/flight" or "/flights")
             {
-                return "✈️ *Flight Search*\n\n" +
-                       "I'll help you find flights! Please tell me:\n\n" +
-                       "1. Where are you flying *from*? (airport code, e.g., LOS)\n" +
-                       "2. Where are you flying *to*? (e.g., LHR)\n" +
-                       "3. When? (e.g., 2026-03-15)\n\n" +
-                       "Or describe your trip and I'll help!";
+                // Start the shared free-text flight conversation
+                var sr = await _serviceRequestService.CreateAsync(
+                    "FlightSearch", Channel, user.Id, session.Id,
+                    "Flight search started via /flight command", ct);
+                await _serviceRequestService.UpdateStatusAsync(
+                    sr.RequestCode, ServiceRequestStatus.Processing, "Flight conversation started", ct: ct);
+                await _auditService.LogAsync("SERVICE_REQUEST_CREATED", "ServiceRequest", sr.RequestCode,
+                    user.Id.ToString(), Channel, details: "FlightSearch", ct: ct);
+
+                return await _flightConversation.StartAsync(working);
             }
 
             if (lower is "/mybookings" or "/bookings" or "/reservations")
@@ -314,24 +384,34 @@ namespace WhatsAppBot.Controllers
                 return $"🔎 Searching for: *{query}*\n\nI'll look that up for you! (Search via AI)";
             }
 
-            // ── Default: AI response ────────────────────────────────────
+            // ── Fallback: shared intent router → flight service or AI ───────
+            var route = _intentRouter.Route(text, flightFlowActive: false);
+
+            if (route == MessageRoute.FlightService)
+            {
+                var sr = await _serviceRequestService.CreateAsync(
+                    "FlightSearch", Channel, user.Id, session.Id,
+                    $"Free-text flight request: {Truncate(text, 200)}", ct);
+                await _serviceRequestService.UpdateStatusAsync(
+                    sr.RequestCode, ServiceRequestStatus.Processing, "Flight conversation started", ct: ct);
+                await _auditService.LogAsync("SERVICE_REQUEST_CREATED", "ServiceRequest", sr.RequestCode,
+                    user.Id.ToString(), Channel, details: "FlightSearch (intent router)", ct: ct);
+
+                return await _flightConversation.StartAsync(working);
+            }
+
+            // General AI assistant (resilient: deterministic fallback when AI is down)
             try
             {
-                // Convert AppSession to UserSession for LLM compatibility
-                var legacySession = new UserSession
-                {
-                    PhoneNumber = user.PhoneNumber ?? $"tg_{user.Id}",
-                    Name = user.DisplayName,
-                    Email = user.Email,
-                    State = UserState.Verified
-                };
-
-                var response = await _llm.GetResponseAsync(legacySession, messageText);
-
-                // Create service request for tracking
-                await _serviceRequestService.CreateAsync(
+                var sr = await _serviceRequestService.CreateAsync(
                     "AiAssistance", Channel, user.Id, session.Id,
-                    $"AI query: {(text.Length > 100 ? text[..100] : text)}");
+                    $"AI query: {Truncate(text, 200)}", ct);
+
+                var response = await _llm.GetResponseAsync(working, messageText);
+
+                await _serviceRequestService.CompleteAsync(sr.RequestCode, "response_delivered", ct: ct);
+                await _auditService.LogAsync("SERVICE_REQUEST_COMPLETED", "ServiceRequest", sr.RequestCode,
+                    actorId: "system", channel: Channel, details: "AI response delivered", ct: ct);
 
                 return response;
             }
@@ -342,10 +422,10 @@ namespace WhatsAppBot.Controllers
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // CALLBACK QUERY PROCESSING
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task ProcessCallbackQueryAsync(JsonElement callback, long updateId)
+        // ═══════════════════════════════════════════════════════════════════════
+        private Task ProcessCallbackQueryAsync(JsonElement callback)
         {
             var callbackId = callback.TryGetProperty("id", out var cid) ? cid.GetString() : null;
             var data = callback.TryGetProperty("data", out var d) ? d.GetString() : null;
@@ -353,12 +433,38 @@ namespace WhatsAppBot.Controllers
             _logger.LogInformation("Telegram callback query: {Data}", data);
 
             // Future: handle inline keyboard callbacks
-            await Task.CompletedTask;
+            return Task.CompletedTask;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
+        // PERSISTENCE HELPERS
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task PersistFlowAsync(AppSession session, UserSession working, User user, CancellationToken ct)
+        {
+            try
+            {
+                var flow = FlowContext.FromUserSession(working);
+                session.CurrentState = flow.State.ToString();
+                session.WorkflowStep = flow.ConversationFlightStep != FlightConversationStep.None
+                    ? flow.ConversationFlightStep.ToString()
+                    : null;
+                session.ContextData = flow.ToJson();
+
+                await _sessionService.UpdateSessionAsync(session, ct);
+                await _userService.TouchActivityAsync(user.Id, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist Telegram flow state for session {SessionId}", session.SessionId);
+            }
+        }
+
+        private static string Truncate(string value, int max) =>
+            value.Length <= max ? value : value[..max] + "…";
+
+        // ═══════════════════════════════════════════════════════════════════════
         // SECURITY
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         private bool VerifyWebhookSecret()
         {
             var configuredSecret = _config["Telegram:WebhookSecret"]

@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
@@ -24,16 +25,45 @@ using WhatsAppBot.Services.Scraping;
 
 namespace WhatsAppBot.Controllers
 {
+    /// <summary>
+    /// WhatsApp Cloud API webhook.
+    ///
+    /// ARCHITECTURE (Phase 2 — multi-channel consistency):
+    ///   Webhook (this controller = adapter layer only)
+    ///     → shared application services (User / PersistentSession / Conversation /
+    ///       ServiceRequest / Audit / IntentRouter / LLM / FlightPricing / Reservations)
+    ///     → persistence (SQLite via EF Core)
+    ///     → external integrations (Meta Cloud API, Amadeus, scrapers)
+    ///
+    /// All business rules live in the shared services; the Telegram channel
+    /// uses the exact same services. This controller contains no duplicate
+    /// business logic — only channel-specific parsing and presentation.
+    ///
+    /// Guarantees:
+    ///   • HMAC signature verification (when MetaWhatsApp:AppSecret is set)
+    ///   • Idempotency: duplicate provider message IDs are ignored
+    ///   • Every inbound/outbound message persisted with provider IDs
+    ///   • Flight search/booking/cancellation/AI work tracked as ServiceRequests
+    ///   • Audit events for webhook receipt, rejection, duplicates, requests
+    /// </summary>
     [ApiController]
     [Route("webhook")]
     [Route("api/webhook")]
     public partial class WhatsAppWebhookController : ControllerBase
     {
-        // ── Services ─────────────────────────────────────────────────────
+        private const string Channel = "whatsapp";
+
+        // ── Shared application services ──────────────────────────────────────
         private readonly ILLMService _llm;
-        private readonly ISessionService _session;
         private readonly IWhatsAppService _whatsApp;
-        private readonly IChatLogService _chatLog;
+        private readonly IUserService _userService;
+        private readonly IPersistentSessionService _sessionService;
+        private readonly IConversationService _conversationService;
+        private readonly IServiceRequestService _serviceRequests;
+        private readonly IAuditService _auditService;
+        private readonly IIntentRouter _intentRouter;
+        private readonly FlightConversationService _flightConversation;
+        private readonly IChatLogService _chatLog; // legacy phone-keyed log (preserved)
         private readonly IProductCatalogService _catalog;
         private readonly FlightPricingService _flightPricing;
         private readonly IReservationService _reservations;
@@ -42,9 +72,8 @@ namespace WhatsAppBot.Controllers
         private readonly ILogger<WhatsAppWebhookController> _logger;
         private readonly IConfiguration _config;
         private readonly IImageGenerationService _imageService;
-        private readonly IVisionService _visionService;
 
-        // ── Constants ─────────────────────────────────────────────────────
+        // ── Constants ─────────────────────────────────────────────────────────
         private static readonly HashSet<string> GreetingSet = new(
             new[] {
                 "hi", "hello", "hey", "yo", "sup", "wassup",
@@ -54,11 +83,17 @@ namespace WhatsAppBot.Controllers
             },
             StringComparer.OrdinalIgnoreCase);
 
-        // ── Constructor ───────────────────────────────────────────────────
+        // ── Constructor ───────────────────────────────────────────────────────
         public WhatsAppWebhookController(
             ILLMService llm,
-            ISessionService session,
             IWhatsAppService whatsApp,
+            IUserService userService,
+            IPersistentSessionService sessionService,
+            IConversationService conversationService,
+            IServiceRequestService serviceRequests,
+            IAuditService auditService,
+            IIntentRouter intentRouter,
+            FlightConversationService flightConversation,
             IChatLogService chatLog,
             IProductCatalogService catalog,
             FlightPricingService flightPricing,
@@ -67,12 +102,17 @@ namespace WhatsAppBot.Controllers
             IOptions<ScrapingOptions> scrapingOptions,
             ILogger<WhatsAppWebhookController> logger,
             IConfiguration config,
-            IImageGenerationService imageService,
-            IVisionService visionService)
+            IImageGenerationService imageService)
         {
             _llm = llm;
-            _session = session;
             _whatsApp = whatsApp;
+            _userService = userService;
+            _sessionService = sessionService;
+            _conversationService = conversationService;
+            _serviceRequests = serviceRequests;
+            _auditService = auditService;
+            _intentRouter = intentRouter;
+            _flightConversation = flightConversation;
             _chatLog = chatLog;
             _catalog = catalog;
             _flightPricing = flightPricing;
@@ -82,12 +122,11 @@ namespace WhatsAppBot.Controllers
             _logger = logger;
             _config = config;
             _imageService = imageService;
-            _visionService = visionService;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // WEBHOOK VERIFICATION (Meta requirement)
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         [HttpGet]
         public IActionResult Verify(
             [FromQuery(Name = "hub.mode")] string mode,
@@ -100,17 +139,17 @@ namespace WhatsAppBot.Controllers
                 !string.IsNullOrWhiteSpace(expected) &&
                 string.Equals(token, expected, StringComparison.Ordinal))
             {
-                _logger.LogInformation("✅ Meta webhook verified successfully.");
+                _logger.LogInformation("Meta webhook verified successfully.");
                 return Content(challenge ?? string.Empty, "text/plain");
             }
 
-            _logger.LogWarning("❌ Meta webhook verification failed. Token mismatch.");
+            _logger.LogWarning("Meta webhook verification failed. Token mismatch.");
             return Unauthorized();
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // RECEIVE MESSAGE
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         [HttpPost]
         public async Task<IActionResult> Receive()
         {
@@ -127,47 +166,103 @@ namespace WhatsAppBot.Controllers
 
                 if (!VerifySignature(rawBody))
                 {
-                    _logger.LogWarning("❌ Invalid webhook signature.");
+                    _logger.LogWarning("Invalid webhook signature — rejecting payload.");
+                    await _auditService.LogAsync(
+                        "WEBHOOK_REJECTED", "Webhook", null,
+                        actorId: "system", channel: Channel,
+                        details: "Invalid X-Hub-Signature-256",
+                        ipAddress: HttpContext.Connection.RemoteIpAddress?.ToString(),
+                        ct: HttpContext.RequestAborted);
                     return Unauthorized();
                 }
 
-                if (!TryExtractIncomingMessage(rawBody, out var fromNumber, out var messageText))
+                if (!TryExtractIncomingMessage(rawBody, out var fromNumber, out var messageText, out var providerMessageId))
                     return Ok();
 
                 messageText = (messageText ?? string.Empty).Trim();
                 if (string.IsNullOrWhiteSpace(messageText))
                     return Ok();
 
-                _logger.LogInformation("📨 Message from {Phone}: {Preview}",
+                _logger.LogInformation("Message from {Phone}: {Preview}",
                     fromNumber,
                     messageText.Length > 60 ? $"{messageText[..60]}..." : messageText);
 
-                var session = _session.GetOrCreateSession(fromNumber);
-                var phase = session.State == UserState.Verified ? "chat" : "onboarding";
+                // ── Idempotency: same provider message twice → one business action ─
+                if (!string.IsNullOrWhiteSpace(providerMessageId) &&
+                    await _conversationService.ExistsByProviderMessageIdAsync(providerMessageId, HttpContext.RequestAborted))
+                {
+                    _logger.LogWarning("Duplicate WhatsApp delivery ignored: {MsgId}", providerMessageId);
+                    await _auditService.LogAsync(
+                        "WEBHOOK_DUPLICATE", "Message", providerMessageId,
+                        actorId: "system", channel: Channel,
+                        details: $"provider user {fromNumber}",
+                        ct: HttpContext.RequestAborted);
+                    return Ok();
+                }
 
-                await _chatLog.LogInboundAsync(fromNumber, session.Name, session.Email, messageText, phase);
+                var (user, _identity, created) = await _userService.FindOrCreateByChannelAsync(
+                    Channel, fromNumber, null, HttpContext.RequestAborted);
 
-                var replyText = await ProcessMessageAsync(session, messageText);
+                if (created)
+                {
+                    await _auditService.LogAsync(
+                        "USER_CREATED", "User", user.Id.ToString(),
+                        actorId: "system", channel: Channel,
+                        details: $"provider user {fromNumber}",
+                        ct: HttpContext.RequestAborted);
+                }
+
+                var session = await _sessionService.GetOrCreateSessionAsync(
+                    Channel, fromNumber, user.Id, HttpContext.RequestAborted);
+
+                // Persist the inbound message (shared platform message store)
+                var inbound = await _conversationService.LogInboundAsync(
+                    Channel, fromNumber, messageText, providerMessageId,
+                    session.Id, user.Id, ct: HttpContext.RequestAborted);
+
+                await _auditService.LogAsync(
+                    "WEBHOOK_RECEIVED", "Message", inbound.Id.ToString(),
+                    actorId: fromNumber, channel: Channel,
+                    details: "inbound message",
+                    ipAddress: HttpContext.Connection.RemoteIpAddress?.ToString(),
+                    ct: HttpContext.RequestAborted);
+
+                // ── Restore persisted flow state ──────────────────────────────
+                var flow = FlowContext.FromJson(session.ContextData);
+                var working = flow.ToUserSession(fromNumber);
+                working.ConversationHistory = await LoadPromptHistoryAsync(session.Id, providerMessageId, flow.HistoryClearedAtUtc);
+
+                var phase = working.State == UserState.Verified ? "chat" : "onboarding";
+
+                // Legacy phone-keyed chat log (preserved for continuity)
+                await _chatLog.LogInboundAsync(fromNumber, working.Name, working.Email, messageText, phase);
+
+                var replyText = await ProcessMessageAsync(working, messageText, user, session);
 
                 if (!string.IsNullOrWhiteSpace(replyText))
                 {
                     await _whatsApp.SendMessageAsync(fromNumber, replyText);
-                    await _chatLog.LogOutboundAsync(fromNumber, session.Name, session.Email, replyText, phase);
+                    await _chatLog.LogOutboundAsync(fromNumber, working.Name, working.Email, replyText, phase);
+                    await _conversationService.LogOutboundAsync(
+                        Channel, fromNumber, replyText, session.Id, user.Id,
+                        ct: HttpContext.RequestAborted);
                 }
 
-                _session.UpdateSession(session);
+                // ── Persist updated flow state + user profile ─────────────────
+                await PersistFlowAsync(session, working, user);
+
                 return Ok();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "💥 Error processing webhook");
+                _logger.LogError(ex, "Error processing WhatsApp webhook");
                 return Ok(); // Always return 200 to Meta
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // SECURITY: Verify webhook signature from Meta
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         private bool VerifySignature(string rawBody)
         {
             var appSecret = _config["MetaWhatsApp:AppSecret"];
@@ -190,13 +285,15 @@ namespace WhatsAppBot.Controllers
                 Encoding.UTF8.GetBytes(expectedHash.ToLowerInvariant()));
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // PARSE: Extract message from Meta webhook payload
-        // ═══════════════════════════════════════════════════════════════════
-        private static bool TryExtractIncomingMessage(string json, out string from, out string text)
+        // ═══════════════════════════════════════════════════════════════════════
+        private static bool TryExtractIncomingMessage(
+            string json, out string from, out string text, out string? providerMessageId)
         {
             from = string.Empty;
             text = string.Empty;
+            providerMessageId = null;
 
             try
             {
@@ -216,6 +313,8 @@ namespace WhatsAppBot.Controllers
 
                 var msg = messages[0];
                 from = msg.GetProperty("from").GetString() ?? string.Empty;
+                if (msg.TryGetProperty("id", out var id))
+                    providerMessageId = id.GetString();
                 var type = msg.GetProperty("type").GetString() ?? string.Empty;
 
                 if (type == "text" && msg.TryGetProperty("text", out var txtObj))
@@ -229,24 +328,24 @@ namespace WhatsAppBot.Controllers
             catch { return false; }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // MAIN ROUTER: Direct to correct state handler
-        // ═══════════════════════════════════════════════════════════════════
-        private Task<string> ProcessMessageAsync(UserSession session, string messageText)
+        // ═══════════════════════════════════════════════════════════════════════
+        private Task<string> ProcessMessageAsync(UserSession session, string messageText, User user, AppSession appSession)
         {
             return session.State switch
             {
                 UserState.New => Task.FromResult(HandleNewUser(session)),
                 UserState.AwaitingName => Task.FromResult(HandleNameInput(session, messageText)),
                 UserState.AwaitingEmail => Task.FromResult(HandleEmailInput(session, messageText)),
-                UserState.Verified => HandleVerifiedUserAsync(session, messageText),
+                UserState.Verified => HandleVerifiedUserAsync(session, messageText, user, appSession),
                 _ => Task.FromResult("Something went wrong. Please try again.")
             };
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // ONBOARDING FLOW
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         private string HandleNewUser(UserSession session)
         {
             var botName = _config["Bot:Name"] ?? "Femzyk_Aje_Bot";
@@ -305,41 +404,48 @@ Welcome to *{botName}*! Here's what I can do:
 ❌ */cancelbooking* → Cancel a reservation
 🛍️ */products* → Browse products
 💬 Just *type anything* to chat with AI!
+🆘 */agent* → Talk to a human agent
 🆘 */help* → Full command list";
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // VERIFIED USER: Route to correct feature
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task<string> HandleVerifiedUserAsync(UserSession session, string messageText)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task<string> HandleVerifiedUserAsync(UserSession session, string messageText, User user, AppSession appSession)
         {
             var text = (messageText ?? string.Empty).Trim();
             var lower = text.ToLowerInvariant();
 
-            // ── Active flow routing ──────────────────────────────────────
+            // ── Active flight flow routing (numbered search/booking/cancel flow) ─
             if (session.FlightStep != FlightStep.None && lower != "/flightcancel")
             {
                 // Search flow (steps 1-9)
                 if (session.FlightStep >= FlightStep.ChooseAirline &&
                     session.FlightStep <= FlightStep.Confirm)
-                    return await ContinueFlightSearchFlowAsync(session, text);
+                    return await ContinueFlightSearchFlowAsync(session, text, user, appSession);
 
                 // Booking flow (steps 10-21)
                 if (session.FlightStep >= FlightStep.ViewResults &&
                     session.FlightStep <= FlightStep.BookingComplete)
-                    return await ContinueBookingFlowAsync(session, text);
+                    return await ContinueBookingFlowAsync(session, text, user, appSession);
 
                 // Cancellation flow (steps 30-31)
                 if (session.FlightStep >= FlightStep.CancelConfirm)
-                    return await ContinueCancelFlowAsync(session, text);
+                    return await ContinueCancelFlowAsync(session, text, user, appSession);
             }
 
-            // ── Config shortcuts ─────────────────────────────────────────
+            // ── Active free-text flight conversation (shared flight service) ──
+            if (session.ConversationFlightStep != FlightConversationStep.None)
+            {
+                return await _flightConversation.HandleAsync(session, text, HttpContext.RequestAborted);
+            }
+
+            // ── Config shortcuts ──────────────────────────────────────────────
             var botName = _config["Bot:Name"] ?? "Femzyk_Aje_Bot";
             var company = _config["Bot:Company"] ?? "FEMZYK ENTERPRISES LTD";
             var supportEmail = _config["Bot:SupportEmail"] ?? "femzykenterprisesltd@gmail.com";
 
-            // ── Help / Menu ──────────────────────────────────────────────
+            // ── Help / Menu ───────────────────────────────────────────────────
             if (lower is "/help" or "help" or "menu" or "commands" or "/menu" or "/commands")
             {
                 return $@"🤖 *{botName} — Command Center*
@@ -372,7 +478,7 @@ Welcome to *{botName}*! Here's what I can do:
 ━━━━━━━━━━━━━━━━━━━━━━━
 • Type anything to chat with AI
 • Ask about flights, destinations, travel tips
-• Get real-time data from live sources
+• ""I want a flight from LOS to LHR"" starts a search
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 ⚙️ *ACCOUNT*
@@ -380,6 +486,7 @@ Welcome to *{botName}*! Here's what I can do:
 • */status* — Your profile
 • */clear* — Clear chat memory
 • */reset* — Start fresh session
+• */agent* — Escalate to a human agent
 • */help* — This menu
 
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -391,7 +498,7 @@ Welcome to *{botName}*! Here's what I can do:
 _Powered by Azure OpenAI + Live Data_";
             }
 
-            // ── Status ───────────────────────────────────────────────────
+            // ── Status ───────────────────────────────────────────────────────
             if (lower is "/status")
             {
                 return $@"📊 *Your Account*
@@ -399,22 +506,29 @@ _Powered by Azure OpenAI + Live Data_";
 👤 Name: {session.Name}
 📧 Email: {session.Email}
 📱 Phone: {session.PhoneNumber}
-🕐 Session: {session.CreatedAt:MMM dd, yyyy HH:mm} UTC
+🕐 Session: {appSession.CreatedAtUtc:MMM dd, yyyy HH:mm} UTC
 💬 Memory: {session.ConversationHistory.Count} messages
 ✈️ Active flow: {(session.FlightStep == FlightStep.None ? "None" : session.FlightStep.ToString())}";
             }
 
-            // ── Clear memory ─────────────────────────────────────────────
+            // ── Clear memory ─────────────────────────────────────────────────
             if (lower is "/clear")
             {
                 session.ConversationHistory.Clear();
+                session.HistoryClearedAtUtc = DateTime.UtcNow; // persisted via FlowContext
                 return "🧹 Memory cleared! What would you like to talk about?";
             }
 
-            // ── Reset session ────────────────────────────────────────────
+            // ── Reset session ────────────────────────────────────────────────
             if (lower is "/reset" or "/restart")
             {
-                _session.RemoveSession(session.PhoneNumber);
+                session.State = UserState.New;
+                session.ResetAll();
+                session.ConversationFlightStep = FlightConversationStep.None;
+                session.Name = null;
+                session.Email = null;
+                session.ConversationHistory.Clear();
+
                 return "🔄 Your session has been reset.\n\nSend any message to start over!";
             }
 
@@ -445,14 +559,39 @@ _Powered by Azure OpenAI + Live Data_";
                 return "😕 Could not generate image. Please try a different prompt.";
             }
 
-            // ── Cancel active flight search ──────────────────────────────
+            // ── Escalate to human agent (shared service request) ─────────────
+            if (lower is "/agent" or "/human" or "/support" or "/escalate")
+            {
+                var sr = await CreateTrackedRequestAsync(
+                    "HumanEscalation", user, appSession,
+                    "User requested a human agent via WhatsApp", HttpContext.RequestAborted);
+
+                if (sr != null)
+                {
+                    await _serviceRequests.EscalateAsync(sr.RequestCode, "User requested agent", ct: HttpContext.RequestAborted);
+                    await _auditService.LogAsync(
+                        "SERVICE_REQUEST_ESCALATED", "ServiceRequest", sr.RequestCode,
+                        actorId: user.Id.ToString(), channel: Channel,
+                        details: "User requested agent via /agent",
+                        ct: HttpContext.RequestAborted);
+
+                    return "🆘 I've flagged your request for a human agent.\n\n" +
+                           $"Reference: *{sr.RequestCode}*\n\n" +
+                           "A team member will review your conversation and respond.";
+                }
+
+                return "😕 I couldn't register your request. Please try again or email support.";
+            }
+
+            // ── Cancel active flight search ──────────────────────────────────
             if (lower is "/flightcancel")
             {
                 session.ResetAll();
+                session.ConversationFlightStep = FlightConversationStep.None;
                 return "✈️ Flight search cancelled.\n\nType */flight* to start a new search.";
             }
 
-            // ── Start flight search ──────────────────────────────────────
+            // ── Start flight search (numbered flow) ──────────────────────────
             if (lower is "/flight" or "/flights")
             {
                 session.ResetAll();
@@ -474,7 +613,7 @@ Choose an airline by replying with a number or source key:
 Or type */flightcancel* to abort.";
             }
 
-            // ── My bookings ──────────────────────────────────────────────
+            // ── My bookings ──────────────────────────────────────────────────
             if (lower is "/mybookings" or "/bookings" or "/reservations" or "/myreservations")
             {
                 var bookings = await _reservations.GetUserReservationsAsync(
@@ -491,14 +630,14 @@ Or type */flightcancel* to abort.";
                        "\n\nTo cancel: */cancelbooking*";
             }
 
-            // ── Start cancellation flow ──────────────────────────────────
+            // ── Start cancellation flow ──────────────────────────────────────
             if (lower is "/cancelbooking" or "/cancel" or "/cancelreservation")
             {
                 session.FlightStep = FlightStep.CancelConfirm;
                 return "🚫 *Cancel Booking*\n\nEnter your *Reservation Code* (e.g., FZK-260410-1234):";
             }
 
-            // ── Products ─────────────────────────────────────────────────
+            // ── Products ─────────────────────────────────────────────────────
             if (lower is "/products")
             {
                 var items = await _catalog.GetLatestProductsAsync(10);
@@ -511,7 +650,7 @@ Or type */flightcancel* to abort.";
                        "\n\nUse */product <SKU>* to view details.";
             }
 
-            // ── Search products ───────────────────────────────────────────
+            // ── Search products ───────────────────────────────────────────────
             if (lower.StartsWith("/search ", StringComparison.Ordinal))
             {
                 var q = text.Length > 8 ? text[8..].Trim() : string.Empty;
@@ -525,7 +664,7 @@ Or type */flightcancel* to abort.";
                        "\n\nUse */product <SKU>* for details.";
             }
 
-            // ── Product detail ────────────────────────────────────────────
+            // ── Product detail ────────────────────────────────────────────────
             if (lower.StartsWith("/product ", StringComparison.Ordinal))
             {
                 var sku = text.Length > 9 ? text[9..].Trim() : string.Empty;
@@ -556,10 +695,47 @@ Stock: {stock}
 {(string.IsNullOrWhiteSpace(p.Description) ? "" : $"About: {p.Description}")}";
             }
 
-            // ── Fallback: AI response ─────────────────────────────────────
+            // ── Fallback: shared intent router → flight service or AI ────────
+            var route = _intentRouter.Route(text, flightFlowActive: false);
+
+            if (route == MessageRoute.FlightService)
+            {
+                // Start the shared free-text flight conversation
+                var sr = await CreateTrackedRequestAsync(
+                    "FlightSearch", user, appSession,
+                    $"Free-text flight request: {Truncate(text, 200)}", HttpContext.RequestAborted);
+
+                var reply = await _flightConversation.StartAsync(session);
+
+                await _auditService.LogAsync(
+                    "FLIGHT_FLOW_STARTED", "Session", appSession.SessionId,
+                    actorId: user.Id.ToString(), channel: Channel,
+                    details: "Intent router → flight service",
+                    ct: HttpContext.RequestAborted);
+
+                // Keep the tracking request alive across the conversation; it is
+                // completed when the quote is produced (FlightConversationService
+                // is stateless per call, so the SR is completed here as 'processing').
+                if (sr != null)
+                    await _serviceRequests.UpdateStatusAsync(
+                        sr.RequestCode, ServiceRequestStatus.Processing, "Flight conversation started",
+                        ct: HttpContext.RequestAborted);
+
+                return reply;
+            }
+
+            // General AI assistant (resilient: falls back to deterministic commands)
             try
             {
-                return await _llm.GetResponseAsync(session, text);
+                var sr = await CreateTrackedRequestAsync(
+                    "AiAssistance", user, appSession,
+                    $"AI query: {Truncate(text, 200)}", HttpContext.RequestAborted);
+
+                var response = await _llm.GetResponseAsync(session, text);
+
+                await CompleteTrackedRequestAsync(sr, "response_delivered", "AI response delivered", HttpContext.RequestAborted);
+
+                return response;
             }
             catch (Exception ex)
             {
@@ -568,10 +744,10 @@ Stock: {stock}
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // FLIGHT SEARCH FLOW (Steps 1-9)
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task<string> ContinueFlightSearchFlowAsync(UserSession session, string text)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task<string> ContinueFlightSearchFlowAsync(UserSession session, string text, User user, AppSession appSession)
         {
             var airlines = _scrapingOpt.Airlines ?? new List<AirlineTarget>();
 
@@ -642,7 +818,7 @@ Reply with 1, 2 or 3.";
 
                 case FlightStep.ReturnDate:
                     if (!TryParseDateOnly(text, out var returnDate))
-                        return "Invalid date. Use YYYY-MM-DD.";
+                        return "Invalid date. Use YYYY-MM-DD (e.g., 2026-02-20).";
                     if (session.FlightDraft.DepartDate.HasValue && returnDate <= session.FlightDraft.DepartDate.Value)
                         return "Return date must be *after* departure date.";
                     session.FlightDraft.ReturnDate = returnDate;
@@ -686,14 +862,47 @@ Reply *YES* to search prices, or */flightcancel* to abort.";
 
                     if (target == null) { session.ResetAll(); return "Airline not found."; }
 
+                    // Service request for this search (audited lifecycle)
+                    var sr = await CreateTrackedRequestAsync(
+                        "FlightSearch", user, appSession,
+                        $"{target.SourceKey} {session.FlightDraft.From}→{session.FlightDraft.To} {session.FlightDraft.DepartDate:yyyy-MM-dd}",
+                        HttpContext.RequestAborted);
+                    if (sr != null)
+                        await _serviceRequests.UpdateStatusAsync(
+                            sr.RequestCode, ServiceRequestStatus.Processing, "Searching flights",
+                            ct: HttpContext.RequestAborted);
+
                     await _whatsApp.SendMessageAsync(session.PhoneNumber,
                         "🔍 Searching for the best prices... please wait.");
 
-                    var quote = await _flightPricing.GetQuoteAsync(
-                        target, session.FlightDraft, session.FlightPricingMode, HttpContext.RequestAborted);
+                    FlightQuote quote;
+                    try
+                    {
+                        quote = await _flightPricing.GetQuoteAsync(
+                            target, session.FlightDraft, session.FlightPricingMode, HttpContext.RequestAborted);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Flight pricing failed");
+                        await FailTrackedRequestAsync(sr, "Pricing provider error", HttpContext.RequestAborted);
+                        session.ResetAll();
+                        return "😕 Flight search failed. Please try again or use */flightcancel*.";
+                    }
 
                     session.CurrentQuote = quote;
                     session.FlightStep = FlightStep.ViewResults;
+
+                    var searchResult = JsonSerializer.Serialize(new
+                    {
+                        airline = target.SourceKey,
+                        from = session.FlightDraft.From,
+                        to = session.FlightDraft.To,
+                        price = quote.Price,
+                        currency = quote.Currency,
+                        isPriceExact = quote.IsPriceExact,
+                        bookingUrl = quote.BookingUrl
+                    });
+                    await CompleteTrackedRequestAsync(sr, searchResult, "Quote produced", HttpContext.RequestAborted);
 
                     var priceStr = quote.Price.HasValue
                         ? $"*{quote.Currency} {quote.Price.Value:N0}*"
@@ -721,10 +930,10 @@ Reply *CANCEL* to abort";
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // BOOKING FLOW — Passenger collection (Steps 10-21)
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task<string> ContinueBookingFlowAsync(UserSession session, string text)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task<string> ContinueBookingFlowAsync(UserSession session, string text, User user, AppSession appSession)
         {
             if (text.Equals("cancel", StringComparison.OrdinalIgnoreCase))
             {
@@ -784,7 +993,7 @@ Reply *CANCEL* to abort";
 
                 case FlightStep.CollectPassportExpiry:
                     if (!TryParseDateOnly(text, out var expiry))
-                        return "Invalid date. Use YYYY-MM-DD.";
+                        return "Invalid date. Use YYYY-MM-DD (e.g., 2028-05-15).";
                     if (expiry < DateOnly.FromDateTime(DateTime.UtcNow.AddMonths(6)))
                         return "⚠️ Passport must be valid for at least 6 months from travel date.";
                     session.PassengerDraft.PassportExpiry = expiry;
@@ -851,33 +1060,63 @@ Reply *CANCEL* to abort";
 
                     if (airline == null) { session.ResetAll(); return "Airline config error. Please try again."; }
 
-                    // Create reservation in database
-                    var reservation = await _reservations.CreateReservationAsync(
-                        session.PhoneNumber,
-                        session.Name,
-                        session.PassengerDraft.Email,
-                        session.FlightDraft,
-                        session.CurrentQuote!,
-                        airline.Name,
+                    // Service request for the booking (audited lifecycle)
+                    var sr = await CreateTrackedRequestAsync(
+                        "FlightBooking", user, appSession,
+                        $"Booking {airline.SourceKey} {session.FlightDraft.From}→{session.FlightDraft.To} {session.FlightDraft.DepartDate:yyyy-MM-dd}",
                         HttpContext.RequestAborted);
+                    if (sr != null)
+                        await _serviceRequests.UpdateStatusAsync(
+                            sr.RequestCode, ServiceRequestStatus.Processing, "Creating reservation",
+                            ct: HttpContext.RequestAborted);
 
-                    // Attach passenger details
-                    await _reservations.AttachPassengerAsync(
-                        reservation.ReservationCode,
-                        session.PassengerDraft,
-                        HttpContext.RequestAborted);
+                    try
+                    {
+                        // Create reservation in database
+                        var reservation = await _reservations.CreateReservationAsync(
+                            session.PhoneNumber,
+                            session.Name,
+                            session.PassengerDraft.Email,
+                            session.FlightDraft,
+                            session.CurrentQuote!,
+                            airline.Name,
+                            HttpContext.RequestAborted);
 
-                    // Fire automation in background (non-blocking)
-                    _ = Task.Run(() => _orchestrator.ExecuteBookingAsync(
-                        reservation.ReservationCode,
-                        session.FlightDraft,
-                        session.PassengerDraft,
-                        default));
+                        session.ActiveReservationCode = reservation.ReservationCode;
 
-                    var resCode = reservation.ReservationCode;
-                    session.ResetAll();
+                        if (sr != null)
+                        {
+                            // Link the service request to the reservation (auditable)
+                            var tracked = await _serviceRequests.GetByCodeAsync(sr.RequestCode, HttpContext.RequestAborted);
+                            if (tracked != null)
+                            {
+                                tracked.ReservationCode = reservation.ReservationCode;
+                                await _auditService.LogAsync(
+                                    "SERVICE_REQUEST_UPDATED", "ServiceRequest", tracked.RequestCode,
+                                    actorId: "system", channel: Channel,
+                                    details: $"Linked reservation {reservation.ReservationCode}",
+                                    ct: HttpContext.RequestAborted);
+                            }
+                        }
 
-                    return $@"🎉 *Reservation Created!*
+                        // Attach passenger details
+                        await _reservations.AttachPassengerAsync(
+                            reservation.ReservationCode,
+                            session.PassengerDraft,
+                            HttpContext.RequestAborted);
+
+                        // Fire automation in background (non-blocking; orchestrator
+                        // creates its own DI scope so this is safe off-request)
+                        _ = Task.Run(() => _orchestrator.ExecuteBookingAsync(
+                            reservation.ReservationCode,
+                            session.FlightDraft,
+                            session.PassengerDraft,
+                            CancellationToken.None), CancellationToken.None);
+
+                        var resCode = reservation.ReservationCode;
+                        session.ResetAll();
+
+                        return $@"🎉 *Reservation Created!*
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 📋 Code: *{resCode}*
@@ -891,6 +1130,14 @@ Our automation system is now securing your seats on the airline website. You wil
 📋 View bookings: */mybookings*
 ❌ To cancel: */cancelbooking*
 🆘 Help: */help*";
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Reservation creation failed");
+                        await FailTrackedRequestAsync(sr, "Reservation creation failed", HttpContext.RequestAborted);
+                        session.ResetAll();
+                        return "😕 I couldn't create your reservation. Please try again or contact support.";
+                    }
 
                 default:
                     session.ResetAll();
@@ -898,10 +1145,10 @@ Our automation system is now securing your seats on the airline website. You wil
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         // CANCELLATION FLOW (Steps 30-31)
-        // ═══════════════════════════════════════════════════════════════════
-        private async Task<string> ContinueCancelFlowAsync(UserSession session, string text)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task<string> ContinueCancelFlowAsync(UserSession session, string text, User user, AppSession appSession)
         {
             switch (session.FlightStep)
             {
@@ -939,6 +1186,22 @@ Reply *NO* to keep your booking";
                         return "✅ Cancellation aborted. Your booking is safe!";
                     }
 
+                    var sr = await CreateTrackedRequestAsync(
+                        "BookingCancellation", user, appSession,
+                        $"Cancel reservation {session.PendingCancellationCode}",
+                        HttpContext.RequestAborted);
+                    if (sr != null)
+                    {
+                        var tracked = await _serviceRequests.GetByCodeAsync(sr.RequestCode, HttpContext.RequestAborted);
+                        if (tracked != null)
+                        {
+                            tracked.ReservationCode = session.PendingCancellationCode;
+                        }
+                        await _serviceRequests.UpdateStatusAsync(
+                            sr.RequestCode, ServiceRequestStatus.Processing, "Cancelling",
+                            ct: HttpContext.RequestAborted);
+                    }
+
                     var success = await _orchestrator.ExecuteCancellationAsync(
                         session.PendingCancellationCode!,
                         "User requested cancellation via WhatsApp",
@@ -946,13 +1209,18 @@ Reply *NO* to keep your booking";
 
                     session.ResetAll();
 
-                    return success
-                        ? @"✅ *Reservation Successfully Cancelled!*
+                    if (success)
+                    {
+                        await CompleteTrackedRequestAsync(sr, "cancelled", "Reservation cancelled", HttpContext.RequestAborted);
+                        return @"✅ *Reservation Successfully Cancelled!*
 
 Your booking has been cancelled. Any applicable refund will be processed within 5-10 business days.
 
-Type */flight* to book a new flight."
-                        : @"❌ *Cancellation Failed*
+Type */flight* to book a new flight.";
+                    }
+
+                    await FailTrackedRequestAsync(sr, "Cancellation failed", HttpContext.RequestAborted);
+                    return @"❌ *Cancellation Failed*
 
 We couldn't automatically cancel this reservation. Please contact support:
 📧 femzykenterprisesltd@gmail.com";
@@ -963,9 +1231,157 @@ We couldn't automatically cancel this reservation. Please contact support:
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
+        // PERSISTENCE HELPERS (shared platform state)
+        // ═══════════════════════════════════════════════════════════════════════
+        /// <summary>
+        /// Loads recent session messages from the shared message store and maps
+        /// them to the LLM prompt history (user/assistant roles).
+        /// </summary>
+        private async Task<List<ChatMessage>> LoadPromptHistoryAsync(int sessionId, string? currentProviderMessageId, DateTime? historyClearedAt = null)
+        {
+            var history = new List<ChatMessage>();
+            try
+            {
+                var dbMessages = await _conversationService.GetSessionMessagesAsync(sessionId, 20, HttpContext.RequestAborted);
+
+                foreach (var m in dbMessages
+                             .Where(x => x.Content != null)
+                             .Where(x => historyClearedAt == null || x.Timestamp > historyClearedAt)
+                             .OrderBy(x => x.Timestamp))
+                {
+                    // Skip the just-received inbound message (the LLM prompt appends it)
+                    if (m.Direction == "inbound" &&
+                        !string.IsNullOrWhiteSpace(currentProviderMessageId) &&
+                        m.ProviderMessageId == currentProviderMessageId)
+                        continue;
+
+                    if (m.Direction == "inbound")
+                        history.Add(new ChatMessage { Role = "user", Content = m.Content });
+                    else
+                        history.Add(new ChatMessage { Role = "assistant", Content = m.Content });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to load prompt history for session {SessionId}", sessionId);
+            }
+
+            return history;
+        }
+
+        /// <summary>
+        /// Persists the working session state back to the database-backed
+        /// AppSession (state machine + flight flow context) and to the User
+        /// profile (name/email collected during onboarding).
+        /// </summary>
+        private async Task PersistFlowAsync(AppSession session, UserSession working, User user)
+        {
+            var ct = HttpContext.RequestAborted;
+            try
+            {
+                // User profile sync (onboarding collected name/email)
+                if (working.State >= UserState.AwaitingName)
+                {
+                    var nameChanged = working.Name != null && !string.Equals(working.Name, user.DisplayName, StringComparison.Ordinal);
+                    var emailChanged = working.Email != null && !string.Equals(working.Email, user.Email, StringComparison.OrdinalIgnoreCase);
+                    if (nameChanged || emailChanged)
+                    {
+                        user = await _userService.UpdateProfileAsync(
+                            user.Id,
+                            nameChanged ? working.Name : null,
+                            emailChanged ? working.Email : null,
+                            ct);
+                    }
+                }
+
+                // Session state + serialized flow context
+                var flow = FlowContext.FromUserSession(working);
+                session.CurrentState = flow.State.ToString();
+                session.WorkflowStep = flow.FlightStep != FlightStep.None
+                    ? flow.FlightStep.ToString()
+                    : flow.ConversationFlightStep != FlightConversationStep.None
+                        ? flow.ConversationFlightStep.ToString()
+                        : null;
+                session.ContextData = flow.ToJson();
+
+                await _sessionService.UpdateSessionAsync(session, ct);
+
+                await _userService.TouchActivityAsync(user.Id, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist flow state for session {SessionId}", session.SessionId);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // SERVICE REQUEST HELPERS (audited lifecycle)
+        // ═══════════════════════════════════════════════════════════════════════
+        private async Task<ServiceRequest?> CreateTrackedRequestAsync(
+            string requestType, User user, AppSession session, string? summary, CancellationToken ct)
+        {
+            try
+            {
+                var sr = await _serviceRequests.CreateAsync(
+                    requestType, Channel, user.Id, session.Id, summary, ct);
+
+                await _auditService.LogAsync(
+                    "SERVICE_REQUEST_CREATED", "ServiceRequest", sr.RequestCode,
+                    actorId: user.Id.ToString(), channel: Channel,
+                    details: requestType, ct);
+
+                return sr;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to create service request ({Type}) — continuing without tracking", requestType);
+                return null;
+            }
+        }
+
+        private async Task CompleteTrackedRequestAsync(
+            ServiceRequest? sr, string? resultData, string? statusMessage, CancellationToken ct)
+        {
+            if (sr == null) return;
+            try
+            {
+                await _serviceRequests.CompleteAsync(sr.RequestCode, resultData, ct);
+                await _auditService.LogAsync(
+                    "SERVICE_REQUEST_COMPLETED", "ServiceRequest", sr.RequestCode,
+                    actorId: "system", channel: Channel,
+                    details: statusMessage, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to complete service request {Code}", sr.RequestCode);
+            }
+        }
+
+        private async Task FailTrackedRequestAsync(
+            ServiceRequest? sr, string? reason, CancellationToken ct)
+        {
+            if (sr == null) return;
+            try
+            {
+                await _serviceRequests.UpdateStatusAsync(sr.RequestCode, ServiceRequestStatus.Failed, reason, ct);
+                await _auditService.LogAsync(
+                    "SERVICE_REQUEST_FAILED", "ServiceRequest", sr.RequestCode,
+                    actorId: "system", channel: Channel,
+                    details: reason, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to mark service request {Code} as failed", sr.RequestCode);
+            }
+        }
+
+        private static string Truncate(string value, int max) =>
+            value.Length <= max ? value : value[..max] + "…";
+
+        // ═══════════════════════════════════════════════════════════════════════
         // HELPER METHODS
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         private static string? NormalizeIata(string input)
         {
             var s = (input ?? "").Trim().ToUpperInvariant();
@@ -1000,5 +1416,79 @@ We couldn't automatically cancel this reservation. Please contact support:
 
         [GeneratedRegex(@"^[a-zA-Z\s\-'\.]+$")]
         private static partial Regex NameRegex();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FLOW CONTEXT — persisted JSON state of the in-flight conversation
+    // ═══════════════════════════════════════════════════════════════════════════
+    /// <summary>
+    /// Serializable snapshot of the working UserSession that is persisted to
+    /// AppSession.ContextData so flight flows survive restarts and reconnects.
+    /// </summary>
+    public sealed class FlowContext
+    {
+        public UserState State { get; set; } = UserState.New;
+        public string? Name { get; set; }
+        public string? Email { get; set; }
+        public FlightStep FlightStep { get; set; } = FlightStep.None;
+        public FlightPricingMode FlightPricingMode { get; set; } = FlightPricingMode.Auto;
+        public FlightConversationStep ConversationFlightStep { get; set; } = FlightConversationStep.None;
+        public FlightSearchDraft FlightDraft { get; set; } = new();
+        public FlightQuote? CurrentQuote { get; set; }
+        public PassengerInfo PassengerDraft { get; set; } = new();
+        public string? ActiveReservationCode { get; set; }
+        public string? PendingCancellationCode { get; set; }
+
+        /// <summary>When the user cleared memory; prompt history before this is ignored.</summary>
+        public DateTime? HistoryClearedAtUtc { get; set; }
+
+        public static FlowContext FromUserSession(UserSession s) => new()
+        {
+            State = s.State,
+            Name = s.Name,
+            Email = s.Email,
+            FlightStep = s.FlightStep,
+            FlightPricingMode = s.FlightPricingMode,
+            ConversationFlightStep = s.ConversationFlightStep,
+            FlightDraft = s.FlightDraft,
+            CurrentQuote = s.CurrentQuote,
+            PassengerDraft = s.PassengerDraft,
+            ActiveReservationCode = s.ActiveReservationCode,
+            PendingCancellationCode = s.PendingCancellationCode,
+            HistoryClearedAtUtc = s.HistoryClearedAtUtc
+        };
+
+        public UserSession ToUserSession(string phoneNumber) => new()
+        {
+            PhoneNumber = phoneNumber,
+            Name = Name,
+            Email = Email,
+            State = State,
+            FlightStep = FlightStep,
+            FlightPricingMode = FlightPricingMode,
+            ConversationFlightStep = ConversationFlightStep,
+            FlightDraft = FlightDraft ?? new FlightSearchDraft(),
+            CurrentQuote = CurrentQuote,
+            PassengerDraft = PassengerDraft ?? new PassengerInfo(),
+            ActiveReservationCode = ActiveReservationCode,
+            PendingCancellationCode = PendingCancellationCode,
+            HistoryClearedAtUtc = HistoryClearedAtUtc
+        };
+
+        public string ToJson() => JsonSerializer.Serialize(this);
+
+        public static FlowContext FromJson(string? json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return new FlowContext();
+            try
+            {
+                return JsonSerializer.Deserialize<FlowContext>(json) ?? new FlowContext();
+            }
+            catch
+            {
+                // Corrupt context data: start fresh rather than crashing the user
+                return new FlowContext();
+            }
+        }
     }
 }

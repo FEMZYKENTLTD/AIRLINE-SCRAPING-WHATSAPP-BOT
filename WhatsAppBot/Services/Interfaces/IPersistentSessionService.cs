@@ -27,5 +27,12 @@ namespace WhatsAppBot.Services.Interfaces
 
         /// <summary>Get count of active sessions.</summary>
         Task<int> GetActiveCountAsync(CancellationToken ct = default);
+
+        /// <summary>
+        /// Reset a session to a fresh state (the /reset command): back to "New",
+        /// workflow step and context data cleared, activity refreshed.
+        /// The linked User record is untouched.
+        /// </summary>
+        Task<AppSession> ResetAsync(AppSession session, CancellationToken ct = default);
     }
 }

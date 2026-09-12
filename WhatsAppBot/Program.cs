@@ -229,7 +229,6 @@ try
     // ═════════════════════════════════════════════════════════════════════════
 
     // ── WhatsApp (Meta Cloud API) ────────────────────────────────────────────
-    builder.Services.AddSingleton<ISessionService, InMemorySessionService>(); // Legacy - still used by WhatsApp controller
     builder.Services.AddSingleton<IWhatsAppService, MetaWhatsAppService>();
 
     // ── Telegram ─────────────────────────────────────────────────────────────
@@ -239,14 +238,19 @@ try
     // BUSINESS SERVICES
     // ═════════════════════════════════════════════════════════════════════════
 
-    // ── LLM / AI Service (wrapped with resilience) ───────────────────────────
+    // ── LLM / AI Service (wrapped with resilience + interaction logging) ─────
     builder.Services.AddScoped<AzureOpenAiService>();
     builder.Services.AddScoped<ILLMService>(sp =>
     {
         var inner = sp.GetRequiredService<AzureOpenAiService>();
         var logger = sp.GetRequiredService<ILogger<ResilientLlmService>>();
-        return new ResilientLlmService(inner, logger);
+        var db = sp.GetRequiredService<AppDbContext>();
+        return new ResilientLlmService(inner, logger, db);
     });
+
+    // ── Shared intent routing + flight conversation (multi-channel) ──────────
+    builder.Services.AddScoped<IIntentRouter, IntentRouter>();
+    builder.Services.AddScoped<FlightConversationService>();
 
     builder.Services.AddScoped<IChatLogService, ChatLogService>();
     builder.Services.AddScoped<IProductCatalogService, ProductCatalogService>();

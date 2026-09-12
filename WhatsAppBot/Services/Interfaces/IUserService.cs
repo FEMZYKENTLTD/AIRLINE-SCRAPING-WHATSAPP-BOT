@@ -10,8 +10,12 @@ namespace WhatsAppBot.Services.Interfaces
     /// </summary>
     public interface IUserService
     {
-        /// <summary>Find or create a user by channel identity.</summary>
-        Task<(User User, ChannelIdentity Identity)> FindOrCreateByChannelAsync(
+        /// <summary>
+        /// Find or create a user by channel identity.
+        /// The <c>Created</c> flag is true when a brand-new user row was created
+        /// (consumers use it to emit USER_CREATED audit events).
+        /// </summary>
+        Task<(User User, ChannelIdentity Identity, bool Created)> FindOrCreateByChannelAsync(
             string channel, string providerUserId, string? displayName, CancellationToken ct = default);
 
         /// <summary>Get user by internal ID.</summary>

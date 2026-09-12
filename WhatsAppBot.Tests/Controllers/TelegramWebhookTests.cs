@@ -2,10 +2,13 @@ using System;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Moq;
 using WhatsAppBot.Controllers;
 using WhatsAppBot.Models;
+using WhatsAppBot.Services.Flights;
 using WhatsAppBot.Services.Interfaces;
+using WhatsAppBot.Services.Scraping;
 using Xunit;
 
 namespace WhatsAppBot.Tests.Controllers
@@ -27,6 +30,15 @@ namespace WhatsAppBot.Tests.Controllers
             var serviceRequestService = new Mock<IServiceRequestService>();
             var llm = new Mock<ILLMService>();
             var auditService = new Mock<IAuditService>();
+            var intentRouter = new Mock<IIntentRouter>();
+            var flightPricing = new FlightPricingService(
+                Array.Empty<IFlightPricingProvider>(),
+                Options.Create(new FlightPricingOptions()),
+                new Mock<ILogger<FlightPricingService>>().Object);
+            var flightConversation = new FlightConversationService(
+                flightPricing,
+                Options.Create(new ScrapingOptions()),
+                new Mock<ILogger<FlightConversationService>>().Object);
             var config = new Mock<Microsoft.Extensions.Configuration.IConfiguration>();
             var logger = new Mock<ILogger<TelegramWebhookController>>();
 
@@ -38,6 +50,8 @@ namespace WhatsAppBot.Tests.Controllers
                 serviceRequestService.Object,
                 llm.Object,
                 auditService.Object,
+                intentRouter.Object,
+                flightConversation,
                 config.Object,
                 logger.Object);
 

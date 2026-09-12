@@ -129,7 +129,20 @@ namespace WhatsAppBot.Services.Implementations
         {
             var now = DateTime.UtcNow;
             return await _db.AppSessions
-                .CountAsync(s => !s.IsExpired && s.CurrentState != "Expired", ct);
+                .CountAsync(s => s.ExpiresAtUtc == null || s.ExpiresAtUtc >= now, ct);
+        }
+
+        public async Task<AppSession> ResetAsync(AppSession session, CancellationToken ct = default)
+        {
+            session.CurrentState = "New";
+            session.WorkflowStep = null;
+            session.ContextData = null;
+            session.Touch(_sessionTimeout);
+
+            await _db.SaveChangesAsync(ct);
+
+            _logger.LogInformation("Session {SessionId} reset to fresh state", session.SessionId);
+            return session;
         }
     }
 }

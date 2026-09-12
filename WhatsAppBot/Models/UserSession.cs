@@ -31,6 +31,12 @@ namespace WhatsAppBot.Models
         public string? ActiveReservationCode { get; set; }
         public string? PendingCancellationCode { get; set; }
 
+        /// <summary>
+        /// Set by /clear. Prompt history older than this timestamp is ignored
+        /// so the AI starts from a clean slate (persisted via FlowContext).
+        /// </summary>
+        public DateTime? HistoryClearedAtUtc { get; set; }
+
         public void UpdateActivity() => LastActivity = DateTime.UtcNow;
 
         public void ResetFlightFlow()
