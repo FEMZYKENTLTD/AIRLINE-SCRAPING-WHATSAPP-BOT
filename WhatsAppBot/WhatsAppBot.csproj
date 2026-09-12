@@ -5,7 +5,9 @@
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
-		<NoWarn>$(NoWarn);CS1591;CS8618</NoWarn>
+		<!-- CS1591: missing XML doc comments. CS1570-1592: malformed/partial XML doc
+		     comments (pre-existing in legacy files). CS8618: non-nullable fields. -->
+		<NoWarn>$(NoWarn);CS1591;CS1570;CS1571;CS1572;CS1573;CS1574;CS1584;CS1586;CS1587;CS1589;CS1592;CS8618</NoWarn>
 	</PropertyGroup>
 
 	<ItemGroup>

@@ -145,6 +145,7 @@ namespace WhatsAppBot.Services.Implementations
             {
                 _logger.LogError(ex, "Meta send transport failure to {To}", toNumber);
             }
+        }
 
         private static string StripWhatsAppPrefix(string number)
         {

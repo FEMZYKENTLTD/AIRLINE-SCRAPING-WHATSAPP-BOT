@@ -55,15 +55,31 @@ jobs:
         run: dotnet restore WhatsAppBot.sln
 
       - name: Build solution (Release)
-        run: dotnet build WhatsAppBot.sln -c Release --no-restore
+        run: |
+          set -o pipefail
+          if ! dotnet build WhatsAppBot.sln -c Release --no-restore 2>&1 | tee build-output.log; then
+            # Surface compiler errors as check-run annotations so they are
+            # visible even when raw logs are unavailable.
+            grep -E "error [A-Z]+[0-9]+" build-output.log | head -60 | \
+              while IFS= read -r line; do echo "::error title=Build error::${line}"; done
+            exit 1
+          fi
 
       # Tests run with a machine-readable TRX logger plus a detailed console
       # log. If any test fails this step fails (default behavior).
       - name: Run tests (Release)
         run: |
-          dotnet test WhatsAppBot.sln -c Release --no-build \
-            --logger "console;verbosity=detailed" \
-            --logger "trx;LogFileName=test-results.trx"
+          set -o pipefail
+          if ! dotnet test WhatsAppBot.sln -c Release --no-build \
+              --logger "console;verbosity=detailed" \
+              --logger "trx;LogFileName=test-results.trx" 2>&1 | tee test-output.log; then
+            # Surface failing test names as check-run annotations.
+            grep -E "^\s*Failed " test-output.log | head -60 | \
+              while IFS= read -r line; do echo "::error title=Test failed::${line}"; done
+            grep -E "^\s+Failed!|^\s+Failed: " test-output.log | head -5 | \
+              while IFS= read -r line; do echo "::error title=Test summary::${line}"; done
+            exit 1
+          fi
 
       - name: Upload test results (TRX)
         if: always()
