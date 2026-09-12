@@ -72,6 +72,15 @@ try
         ["Amadeus:ClientSecret"] = Env("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["Amadeus:ClientSecret"],
         ["Amadeus:BaseUrl"] = Env("AMADEUS_BASE_URL") ?? builder.Configuration["Amadeus:BaseUrl"],
 
+        // LLM tuning (documented in .env.example — previously unmapped)
+        ["LLM:MaxTokens"] = Env("LLM_MAX_TOKENS") ?? builder.Configuration["LLM:MaxTokens"],
+        ["LLM:Temperature"] = Env("LLM_TEMPERATURE") ?? builder.Configuration["LLM:Temperature"],
+        ["LLM:MaxHistoryMessages"] = Env("LLM_MAX_HISTORY_MESSAGES") ?? builder.Configuration["LLM:MaxHistoryMessages"],
+
+        // Session configuration (documented in .env.example — previously unmapped)
+        ["Session:TimeoutMinutes"] = Env("SESSION_TIMEOUT_MINUTES") ?? builder.Configuration["Session:TimeoutMinutes"],
+        ["Session:CleanupIntervalMinutes"] = Env("SESSION_CLEANUP_INTERVAL_MINUTES") ?? builder.Configuration["Session:CleanupIntervalMinutes"],
+
         // CAPTCHA
         ["CaptchaService:ApiKey"] = Env("CAPTCHA_API_KEY") ?? string.Empty,
         ["CaptchaService:Provider"] = Env("CAPTCHA_SERVICE_PROVIDER") ?? "self",
@@ -323,7 +332,49 @@ try
     app.UseAuthorization();
     app.MapControllers();
 
-    // ─── Health endpoint ─────────────────────────────────────────────────────
+    // ─── Health endpoints ────────────────────────────────────────────────────
+    // /health      = LIVENESS. Always 200 while the process is alive.
+    //                Requires NO external credentials (WhatsApp/Telegram/AI/Amadeus).
+    // /health/ready = READINESS. 200 when the database is reachable, else 503.
+    // /api/admin/health = detailed health (kept for back-compat, no auth).
+    var startedAtUtc = DateTime.UtcNow;
+
+    app.MapGet("/health", () => Results.Json(new
+    {
+        status = "Healthy",
+        service = "FEMZYK ENTERPRISES - Multi-Channel AI Service Platform",
+        version = "3.0",
+        uptimeSeconds = (int)(DateTime.UtcNow - startedAtUtc).TotalSeconds,
+        timestamp = DateTime.UtcNow
+    }));
+
+    app.MapGet("/health/ready", async (AppDbContext db, Microsoft.Extensions.Hosting.IHostApplicationLifetime lifetime) =>
+    {
+        var dbHealthy = false;
+        try
+        {
+            dbHealthy = await db.Database.CanConnectAsync();
+        }
+        catch
+        {
+            dbHealthy = false;
+        }
+
+        var ready = dbHealthy;
+        var payload = new
+        {
+            status = ready ? "Ready" : "NotReady",
+            database = dbHealthy ? "Connected" : "Unavailable",
+            application = lifetime.ApplicationStarted ? "Started" : "Starting",
+            timestamp = DateTime.UtcNow
+        };
+
+        return ready
+            ? Results.Ok(payload)
+            : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
+    });
+
+    // ─── Service info endpoint ───────────────────────────────────────────────
     app.MapGet("/", () => new
     {
         service = "FEMZYK ENTERPRISES - Multi-Channel AI Service Platform",
@@ -351,7 +402,9 @@ try
             webhook_telegram = "/telegram",
             admin = "/api/admin",
             auth = "/api/auth/login",
-            health = "/api/admin/health",
+            health = "/health",
+            health_ready = "/health/ready",
+            admin_health = "/api/admin/health",
             swagger = "/swagger"
         }
     });

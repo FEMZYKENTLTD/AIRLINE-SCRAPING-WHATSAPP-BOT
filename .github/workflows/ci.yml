@@ -1,53 +1,220 @@
+# ============================================================================
+# CI/CD Pipeline — Airline Service Management Platform
+#
+# EVERY PUSH (any branch) and EVERY PR to main runs:
+#   1. build-and-test  : .NET 8 restore → build (Release) → tests (TRX + console)
+#                         → publish → artifacts
+#   2. security-scan   : secret scanning + static configuration validation
+#   3. docker-smoke    : docker build → run container → /health + /health/ready
+#
+# Design rules (see docs/CI-CD.md):
+#   - No secrets are used or printed by this workflow.
+#   - No continue-on-error on required steps.
+#   - Test results are uploaded even when tests fail (for diagnosis).
+#   - The Docker image is built and runtime-smoke-tested, never pushed to a registry.
+# ============================================================================
+
 name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop, 'arena/**']
+    branches: ["**"]
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
 jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 1 — BUILD & TEST
+  # ════════════════════════════════════════════════════════════════════════
   build-and-test:
+    name: .NET 8 — Build & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
+      - name: Setup .NET 8 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
+      - name: Show toolchain versions
+        run: |
+          dotnet --info
+          dotnet --list-sdks
+
       - name: Restore dependencies
-        run: dotnet restore
+        run: dotnet restore WhatsAppBot.sln
 
-      - name: Build solution
-        run: dotnet build --no-restore --configuration Release
+      - name: Build solution (Release)
+        run: dotnet build WhatsAppBot.sln --no-restore --configuration Release --verbosity minimal
 
-      - name: Run tests
-        run: dotnet test --no-build --configuration Release --verbosity normal --logger "console;verbosity=detailed"
+      - name: Run tests (TRX + detailed console)
+        run: >
+          dotnet test WhatsAppBot.Tests/WhatsAppBot.Tests.csproj
+          --no-build --configuration Release
+          --logger trx
+          --logger "console;verbosity=detailed"
+          --results-directory ./test-results
+          --collect:"XPlat Code Coverage"
 
-      - name: Publish
-        run: dotnet publish WhatsAppBot/WhatsAppBot.csproj -c Release -o ./publish --no-build
+      - name: Print test summary from TRX
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import glob, sys
+          from xml.etree import ElementTree as ET
 
-      - name: Upload build artifact
+          total = passed = failed = skipped = 0
+          failures = []
+          for f in glob.glob("test-results/*.trx"):
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError as e:
+                  print(f"warning: could not parse {f}: {e}")
+                  continue
+              for tr in root.iter("UnitTestResult"):
+                  total += 1
+                  outcome = tr.get("outcome", "")
+                  if outcome == "Passed":
+                      passed += 1
+                  elif outcome == "Skipped":
+                      skipped += 1
+                  else:
+                      failed += 1
+                      msg = tr.find("Output/ErrorMessage")
+                      failures.append(f"  ✗ {tr.get('testName')}: {(msg.text or '')[:300] if msg is not None else 'no message'}")
+
+          print("=" * 60)
+          print(f"TEST SUMMARY: total={total} passed={passed} failed={failed} skipped={skipped}")
+          for line in failures[:50]:
+              print(line)
+          print("=" * 60)
+          if failed:
+              sys.exit(1)
+          PYEOF
+
+      - name: Upload test results (TRX + coverage)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            test-results/
+          retention-days: 14
+          include-hidden-files: true
+
+      - name: Publish application (Release)
+        run: dotnet publish WhatsAppBot/WhatsAppBot.csproj --no-build --configuration Release --output ./publish
+
+      - name: Upload publish output
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: publish-output
-          path: ./publish
+          path: publish/
           retention-days: 7
 
-  docker-build:
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 2 — SECURITY (secret scan + configuration validation)
+  # ════════════════════════════════════════════════════════════════════════
+  security-scan:
+    name: Security — Secrets & Config
     runs-on: ubuntu-latest
-    needs: build-and-test
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Secret scan (current tree)
+        run: bash scripts/scan-secrets.sh
+
+      - name: Configuration validation
+        run: bash scripts/validate-config.sh
+
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 3 — DOCKER BUILD + RUNTIME SMOKE TEST
+  # ════════════════════════════════════════════════════════════════════════
+  docker-smoke:
+    name: Docker — Build & Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [build-and-test, security-scan]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t airline-service-platform:latest -f WhatsAppBot/Dockerfile WhatsAppBot/
+        run: docker build --pull --tag airline-platform:ci -f WhatsAppBot/Dockerfile WhatsAppBot/
 
-      - name: Verify Docker image
-        run: docker image inspect airline-service-platform:latest
+      - name: Inspect Docker image
+        run: docker image inspect airline-platform:ci | tee docker-image-metadata.json
+
+      - name: Run container
+        run: |
+          docker run -d --name platform-smoke --publish 8080:8080 airline-platform:ci
+          echo "Container started:"
+          docker ps --filter name=platform-smoke
+
+      - name: Wait for liveness (/health)
+        run: |
+          ok=""
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8080/health > /tmp/health.json 2>/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "❌ SMOKE TEST FAILED: /health never became healthy"
+            docker logs platform-smoke 2>&1 | tail -n 100
+            exit 1
+          fi
+          echo "✅ Liveness endpoint /health:"
+          cat /tmp/health.json; echo
+
+      - name: Verify readiness (/health/ready)
+        run: |
+          curl -fsS http://127.0.0.1:8080/health/ready > /tmp/ready.json
+          echo "✅ Readiness endpoint /health/ready:"
+          cat /tmp/ready.json; echo
+          grep -q '"status":"Ready"' /tmp/ready.json || { echo "❌ Readiness not Ready"; exit 1; }
+          grep -q '"database":"Connected"' /tmp/ready.json || { echo "❌ Database not connected"; exit 1; }
+
+      - name: Verify service info endpoint (/)
+        run: |
+          curl -fsS http://127.0.0.1:8080/ > /tmp/info.json
+          echo "✅ Service info endpoint /:"
+          cat /tmp/info.json; echo
+          grep -q '"status":"Running"' /tmp/info.json || { echo "❌ Service info unexpected"; exit 1; }
+
+      - name: Save container logs (evidence)
+        if: always()
+        run: docker logs platform-smoke > smoke-container-logs.txt 2>&1 || { echo "warning: could not capture container logs"; docker ps -a; true; }
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f platform-smoke || true
+
+      - name: Upload Docker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-smoke-evidence
+          path: |
+            docker-image-metadata.json
+            smoke-container-logs.txt
+          retention-days: 14

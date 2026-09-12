@@ -40,8 +40,8 @@ EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
 ENV ASPNETCORE_ENVIRONMENT=Production
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/ || exit 1
+# Health check (liveness endpoint — no external credentials required)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["dotnet", "WhatsAppBot.dll"]
