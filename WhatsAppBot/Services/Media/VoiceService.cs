@@ -41,11 +41,11 @@ namespace WhatsAppBot.Services.Media
         private const string DefaultVoice = "en-US-JennyNeural";
 
         public VoiceService(
-            HttpClient http,
+            IHttpClientFactory httpClientFactory,
             IConfiguration config,
             ILogger<VoiceService> logger)
         {
-            _http = http;
+            _http = httpClientFactory.CreateClient();
             _config = config;
             _logger = logger;
         }

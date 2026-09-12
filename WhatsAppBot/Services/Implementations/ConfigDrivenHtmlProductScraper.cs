@@ -1,8 +1,7 @@
-﻿using AngleSharp;
+using AngleSharp;
 using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -45,12 +44,12 @@ namespace WhatsAppBot.Services.Implementations
 
         public ConfigDrivenHtmlProductScraper(
             HttpClient http,
-            IOptions<ScrapeCatalogOptions> options,
+            ScrapeCatalogOptions options,
             ILogger<ConfigDrivenHtmlProductScraper> logger)
         {
             _http = http;
             _logger = logger;
-            _opt = options.Value;
+            _opt = options ?? new ScrapeCatalogOptions();
         }
 
         /// <summary>

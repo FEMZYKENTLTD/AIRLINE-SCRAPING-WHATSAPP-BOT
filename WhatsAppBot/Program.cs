@@ -21,6 +21,7 @@ using WhatsAppBot.Services.Media;
 using WhatsAppBot.Services.Reservations;
 using WhatsAppBot.Services.Scraping;
 using WhatsAppBot.Models.Flights;
+using WhatsAppBot.Models.Scraping;
 
 // ─── Load .env FIRST before anything else ───────────────────────────────────
 ConfigurationExtensions.LoadDotEnv();
@@ -153,8 +154,14 @@ try
     });
 
     // ─── JWT Authentication ──────────────────────────────────────────────────
+    // The well-known default in appsettings.json is treated as UNCONFIGURED so
+    // a forgotten rotation can never result in a publicly-known signing key.
+    const string InsecureDefaultJwtSecret = "CHANGE_ME_TO_A_SECURE_RANDOM_STRING_AT_LEAST_32_CHARS";
     var jwtSecret = builder.Configuration["Jwt:Secret"] ?? string.Empty;
-    if (jwtSecret.Length >= 32)
+    var jwtConfigured = jwtSecret.Length >= 32 &&
+                        !string.Equals(jwtSecret, InsecureDefaultJwtSecret, StringComparison.Ordinal);
+
+    if (jwtConfigured)
     {
         builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer(options =>
@@ -174,7 +181,9 @@ try
     }
     else
     {
-        Log.Warning("JWT secret is too short or default. Admin authentication will be limited.");
+        // Fail safe: authentication disabled → every [Authorize] endpoint returns 401.
+        Log.Warning("JWT secret is missing, too short, or still the default placeholder. " +
+                    "Admin authentication is DISABLED until a strong (32+ char) JWT_SECRET is configured.");
         builder.Services.AddAuthorization();
     }
 
@@ -243,6 +252,7 @@ try
 
     // ── Reservation & Payment ────────────────────────────────────────────────
     builder.Services.AddScoped<IReservationService, ReservationService>();
+    builder.Services.AddScoped<WhatsAppBot.Services.Payments.IPaymentService, WhatsAppBot.Services.Payments.StripePaymentService>();
 
     // ── Per-airline automation classes ────────────────────────────────────────
     builder.Services.AddSingleton<IFlightBookingAutomation, TurkishAirlinesAutomation>();
@@ -283,12 +293,29 @@ try
     {
         foreach (var airline in airlines)
         {
+            // One config-driven scraper per airline target. When the target has
+            // no CSS selectors configured, the scraper safely returns 0 items
+            // (it never fabricates data).
+            var target = airline;
             builder.Services.AddScoped<IProductScraper>(sp =>
             {
                 var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient();
-                var logger = sp.GetRequiredService<ILogger<AirlineProductScraper>>();
-                var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ScrapingOptions>>();
-                return new AirlineProductScraper(http, logger, options, airline);
+                var logger = sp.GetRequiredService<ILogger<ConfigDrivenHtmlProductScraper>>();
+                var catalogOptions = new ScrapeCatalogOptions
+                {
+                    Enabled = scrapingOpts.Enabled,
+                    CatalogUrl = target.StartUrl,
+                    SourceName = target.SourceKey,
+                    UserAgent = scrapingOpts.UserAgent,
+                    HttpTimeoutSeconds = scrapingOpts.RequestTimeoutSeconds,
+                    RequestDelayMs = scrapingOpts.DelayBetweenRequestsMs,
+                    ProductCardSelector = target.ProductCardSelector ?? string.Empty,
+                    NameSelector = target.NameSelector ?? string.Empty,
+                    PriceSelector = target.PriceSelector ?? string.Empty,
+                    LinkSelector = target.LinkSelector,
+                    ImageSelector = target.ImageSelector
+                };
+                return new ConfigDrivenHtmlProductScraper(http, catalogOptions, logger);
             });
         }
         Log.Information("Registered {Count} airline scrapers", airlines.Count);
@@ -323,7 +350,38 @@ try
     app.UseAuthorization();
     app.MapControllers();
 
-    // ─── Health endpoint ─────────────────────────────────────────────────────
+    // ─── Health endpoints ────────────────────────────────────────────────────
+    // /health        → liveness: the process is up (no external deps required)
+    // /health/ready  → readiness: core dependency (database) is reachable
+    // External providers (WhatsApp/Telegram/Azure OpenAI/Amadeus) are optional
+    // and intentionally do NOT gate these endpoints.
+    app.MapGet("/health", () => Results.Ok(new
+    {
+        status = "Healthy",
+        service = "Airline Service Management Platform",
+        version = "3.0.0",
+        timestamp = DateTime.UtcNow
+    }));
+
+    app.MapGet("/health/ready", async (AppDbContext db) =>
+    {
+        bool dbOk = false;
+        try
+        {
+            dbOk = await db.Database.CanConnectAsync();
+        }
+        catch
+        {
+            dbOk = false;
+        }
+
+        return dbOk
+            ? Results.Ok(new { status = "Ready", database = "Connected", version = "3.0.0", timestamp = DateTime.UtcNow })
+            : Results.Json(new { status = "NotReady", database = "Unavailable", version = "3.0.0", timestamp = DateTime.UtcNow },
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+    });
+
+    // ─── Service banner ──────────────────────────────────────────────────────
     app.MapGet("/", () => new
     {
         service = "FEMZYK ENTERPRISES - Multi-Channel AI Service Platform",
@@ -351,7 +409,9 @@ try
             webhook_telegram = "/telegram",
             admin = "/api/admin",
             auth = "/api/auth/login",
-            health = "/api/admin/health",
+            health = "/health",
+            readiness = "/health/ready",
+            admin_health = "/api/admin/health",
             swagger = "/swagger"
         }
     });

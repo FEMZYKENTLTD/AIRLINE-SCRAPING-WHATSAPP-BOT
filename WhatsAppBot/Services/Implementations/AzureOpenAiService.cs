@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
@@ -32,12 +32,12 @@ namespace WhatsAppBot.Services.Implementations
 
         // Constructor without knowledge (backwards compatible)
         public AzureOpenAiService(
-            HttpClient http,
+            IHttpClientFactory httpClientFactory,
             IConfiguration config,
             ILogger<AzureOpenAiService> logger,
             IKnowledgeService? knowledge = null)
         {
-            _http = http;
+            _http = httpClientFactory.CreateClient();
             _config = config;
             _logger = logger;
             _knowledge = knowledge;

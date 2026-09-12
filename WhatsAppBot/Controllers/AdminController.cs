@@ -160,6 +160,9 @@ namespace WhatsAppBot.Controllers
             if (!string.IsNullOrWhiteSpace(channel))
                 query = query.Where(s => s.Channel == channel);
 
+            // Project only database columns (IsExpired is a computed property
+            // and cannot be translated to SQL); compute it client-side below.
+            var now = DateTime.UtcNow;
             var sessions = await query
                 .OrderByDescending(s => s.LastActivityAtUtc)
                 .Skip(skip)
@@ -174,10 +177,25 @@ namespace WhatsAppBot.Controllers
                     workflowStep = s.WorkflowStep,
                     createdAt = s.CreatedAtUtc,
                     lastActivity = s.LastActivityAtUtc,
-                    expiresAt = s.ExpiresAtUtc,
-                    isExpired = s.IsExpired
+                    expiresAt = s.ExpiresAtUtc
                 })
                 .ToListAsync(ct);
+
+            sessions = sessions
+                .Select(s => new
+                {
+                    s.sessionId,
+                    s.channel,
+                    s.conversationId,
+                    s.userId,
+                    s.currentState,
+                    s.workflowStep,
+                    s.createdAt,
+                    s.lastActivity,
+                    s.expiresAt,
+                    isExpired = s.expiresAt.HasValue && s.expiresAt.Value < now
+                })
+                .ToList();
 
             var total = await _db.AppSessions.CountAsync(ct);
 

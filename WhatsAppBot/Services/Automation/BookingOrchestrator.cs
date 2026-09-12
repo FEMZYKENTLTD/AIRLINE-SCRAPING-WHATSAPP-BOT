@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using WhatsAppBot.Models.Flights;
 using WhatsAppBot.Models.Passengers;
@@ -14,16 +15,24 @@ namespace WhatsAppBot.Services.Automation
     public class BookingOrchestrator
     {
         private readonly IEnumerable<IFlightBookingAutomation> _automations;
-        private readonly IReservationService _reservations;
+        private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<BookingOrchestrator> _logger;
+
+        /// <summary>
+        /// Resolves a fresh scoped IReservationService (with its own DbContext).
+        /// The orchestrator is a singleton and may run background work that
+        /// outlives the HTTP request scope, so each operation creates its own scope.
+        /// </summary>
+        private IReservationService Reservations(IServiceScope scope) =>
+            scope.ServiceProvider.GetRequiredService<IReservationService>();
 
         public BookingOrchestrator(
             IEnumerable<IFlightBookingAutomation> automations,
-            IReservationService reservations,
+            IServiceScopeFactory scopeFactory,
             ILogger<BookingOrchestrator> logger)
         {
             _automations = automations;
-            _reservations = reservations;
+            _scopeFactory = scopeFactory;
             _logger = logger;
         }
 
@@ -58,10 +67,14 @@ namespace WhatsAppBot.Services.Automation
             PassengerInfo passenger,
             CancellationToken ct)
         {
-            var reservation = await _reservations.GetByCodeAsync(reservationCode, ct);
+            // Background-safe: run the whole operation in its own DI scope.
+            using var scope = _scopeFactory.CreateScope();
+            var reservations = Reservations(scope);
+
+            var reservation = await reservations.GetByCodeAsync(reservationCode, ct);
             if (reservation == null) return false;
 
-            await _reservations.UpdateStatusAsync(
+            await reservations.UpdateStatusAsync(
                 reservationCode, ReservationStatus.BookingInProgress,
                 "Automation is processing your booking...", ct);
 
@@ -71,7 +84,7 @@ namespace WhatsAppBot.Services.Automation
 
             if (automation == null)
             {
-                await _reservations.UpdateStatusAsync(
+                await reservations.UpdateStatusAsync(
                     reservationCode, ReservationStatus.Failed,
                     "No automation available for this airline.", ct);
                 return false;
@@ -83,13 +96,13 @@ namespace WhatsAppBot.Services.Automation
 
                 if (success)
                 {
-                    await _reservations.UpdateStatusAsync(
+                    await reservations.UpdateStatusAsync(
                         reservationCode, ReservationStatus.Confirmed,
                         "Booking confirmed successfully!", ct);
                 }
                 else
                 {
-                    await _reservations.UpdateStatusAsync(
+                    await reservations.UpdateStatusAsync(
                         reservationCode, ReservationStatus.Failed,
                         "Automation could not complete the booking. Please try manually.", ct);
                 }
@@ -100,7 +113,7 @@ namespace WhatsAppBot.Services.Automation
             {
                 _logger.LogError(ex, "Booking automation failed for {Code}", reservationCode);
 
-                await _reservations.UpdateStatusAsync(
+                await reservations.UpdateStatusAsync(
                     reservationCode, ReservationStatus.Failed,
                     $"Booking failed: {ex.Message}", ct);
 
@@ -113,7 +126,11 @@ namespace WhatsAppBot.Services.Automation
             string reason,
             CancellationToken ct)
         {
-            var reservation = await _reservations.GetByCodeAsync(reservationCode, ct);
+            // Background-safe: run the whole operation in its own DI scope.
+            using var scope = _scopeFactory.CreateScope();
+            var reservations = Reservations(scope);
+
+            var reservation = await reservations.GetByCodeAsync(reservationCode, ct);
             if (reservation == null) return false;
 
             if (!reservation.CanCancel)
@@ -143,7 +160,7 @@ namespace WhatsAppBot.Services.Automation
                 }
             }
 
-            await _reservations.CancelReservationAsync(reservationCode, reason, ct);
+            await reservations.CancelReservationAsync(reservationCode, reason, ct);
             return true;
         }
     }

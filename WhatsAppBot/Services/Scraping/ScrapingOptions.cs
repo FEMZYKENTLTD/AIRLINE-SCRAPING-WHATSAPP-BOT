@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 namespace WhatsAppBot.Services.Scraping
 {
@@ -32,5 +32,24 @@ namespace WhatsAppBot.Services.Scraping
         /// Optional sitemap URL (great for JS-heavy sites because links are discoverable).
         /// </summary>
         public string? SitemapUrl { get; set; }
+
+        // ── Optional CSS selectors for the config-driven catalog scraper ──
+        // When omitted, the scraper for this airline safely returns 0 items
+        // (it never fabricates data). Provide selectors per site to enable it.
+
+        /// <summary>CSS selector for each product/deal card on the catalog page.</summary>
+        public string? ProductCardSelector { get; set; }
+
+        /// <summary>CSS selector (inside the card) for the product name.</summary>
+        public string? NameSelector { get; set; }
+
+        /// <summary>CSS selector (inside the card) for price text (optional).</summary>
+        public string? PriceSelector { get; set; }
+
+        /// <summary>CSS selector (inside the card) for the "Book now" link (optional).</summary>
+        public string? LinkSelector { get; set; }
+
+        /// <summary>CSS selector (inside the card) for the image (optional).</summary>
+        public string? ImageSelector { get; set; }
     }
 }

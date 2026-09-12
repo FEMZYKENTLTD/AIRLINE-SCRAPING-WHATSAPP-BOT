@@ -32,11 +32,11 @@ namespace WhatsAppBot.Services.Media
         private readonly ILogger<ImageGenerationService> _logger;
 
         public ImageGenerationService(
-            HttpClient http,
+            IHttpClientFactory httpClientFactory,
             IConfiguration config,
             ILogger<ImageGenerationService> logger)
         {
-            _http = http;
+            _http = httpClientFactory.CreateClient();
             _config = config;
             _logger = logger;
         }

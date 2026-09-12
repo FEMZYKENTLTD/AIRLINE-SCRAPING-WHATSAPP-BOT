@@ -41,13 +41,29 @@ namespace WhatsAppBot.Controllers
                 return StatusCode(503, new { error = "Authentication not configured" });
             }
 
-            if (request.Username != adminUsername || request.Password != adminPassword)
+            var secret = _config["Jwt:Secret"] ?? string.Empty;
+            if (secret.Length < 32 ||
+                string.Equals(secret, "CHANGE_ME_TO_A_SECURE_RANDOM_STRING_AT_LEAST_32_CHARS", StringComparison.Ordinal))
+            {
+                _logger.LogWarning("JWT secret not configured (or still default). Login rejected.");
+                return StatusCode(503, new { error = "JWT secret not configured" });
+            }
+
+            // Constant-time comparison to avoid user enumeration via timing.
+            var usernameMatch = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.UTF8.GetBytes(request.Username ?? string.Empty),
+                System.Text.Encoding.UTF8.GetBytes(adminUsername));
+            var passwordMatch = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.UTF8.GetBytes(request.Password ?? string.Empty),
+                System.Text.Encoding.UTF8.GetBytes(adminPassword));
+
+            if (!usernameMatch || !passwordMatch)
             {
                 _logger.LogWarning("Failed login attempt for user: {Username}", request.Username);
                 return Unauthorized(new { error = "Invalid credentials" });
             }
 
-            var token = GenerateJwtToken(request.Username);
+            var token = GenerateJwtToken(request.Username, secret);
 
             _logger.LogInformation("Admin login successful: {Username}", request.Username);
 
@@ -59,12 +75,8 @@ namespace WhatsAppBot.Controllers
             });
         }
 
-        private string GenerateJwtToken(string username)
+        private string GenerateJwtToken(string username, string secret)
         {
-            var secret = _config["Jwt:Secret"]
-                ?? Environment.GetEnvironmentVariable("JWT_SECRET")
-                ?? throw new InvalidOperationException("JWT secret not configured");
-
             var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
             var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 

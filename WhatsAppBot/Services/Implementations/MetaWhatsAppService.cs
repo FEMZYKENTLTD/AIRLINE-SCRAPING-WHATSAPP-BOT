@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -21,19 +21,29 @@ namespace WhatsAppBot.Services.Implementations
     /// NOTE:
     /// Meta Cloud API does NOT accept "whatsapp:" prefix. Use raw E.164 digits like 234xxxxxxxxxx
     /// </summary>
-    public class MetaWhatsAppService(HttpClient http, IConfiguration config, ILogger<MetaWhatsAppService> logger) : IWhatsAppService
+    public class MetaWhatsAppService(IHttpClientFactory httpClientFactory, IConfiguration config, ILogger<MetaWhatsAppService> logger) : IWhatsAppService
     {
-        private readonly HttpClient _http = http;
+        private readonly HttpClient _http = httpClientFactory.CreateClient();
         private readonly ILogger<MetaWhatsAppService> _logger = logger;
 
-        private readonly string _accessToken = config["MetaWhatsApp:AccessToken"]
-            ?? throw new InvalidOperationException("MetaWhatsApp:AccessToken missing");
-
-        private readonly string _phoneNumberId = config["MetaWhatsApp:PhoneNumberId"]
-            ?? throw new InvalidOperationException("MetaWhatsApp:PhoneNumberId missing");
+        // WhatsApp is an OPTIONAL provider: the platform must start and serve
+        // other channels even when WhatsApp credentials are not configured.
+        private readonly string _accessToken = config["MetaWhatsApp:AccessToken"] ?? string.Empty;
+        private readonly string _phoneNumberId = config["MetaWhatsApp:PhoneNumberId"] ?? string.Empty;
 
         private readonly string _graphBase = (config["MetaWhatsApp:GraphBase"] ?? "https://graph.facebook.com").TrimEnd('/');
         private readonly string _apiVersion = (config["MetaWhatsApp:ApiVersion"] ?? "v20.0").Trim();
+
+        /// <summary>Returns true when WhatsApp credentials are configured.</summary>
+        private bool EnsureConfigured()
+        {
+            if (!string.IsNullOrWhiteSpace(_accessToken) && !string.IsNullOrWhiteSpace(_phoneNumberId))
+                return true;
+
+            _logger.LogWarning(
+                "WhatsApp Cloud API is not configured (MetaWhatsApp:AccessToken/PhoneNumberId). Message will NOT be sent.");
+            return false;
+        }
 
         // Conservative chunk size for WhatsApp readability (and reduces edge failures).
         private const int MaxChunk = 1500;
@@ -45,8 +55,8 @@ namespace WhatsAppBot.Services.Implementations
 
             message ??= string.Empty;
 
-            // Ensure authorization is always present
-            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
+            if (!EnsureConfigured())
+                return;
 
             var toNumber = StripWhatsAppPrefix(to);
             var chunks = SplitMessageSmart(message, MaxChunk);
@@ -86,7 +96,8 @@ namespace WhatsAppBot.Services.Implementations
             if (string.IsNullOrWhiteSpace(imageUrl))
                 return;
 
-            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
+            if (!EnsureConfigured())
+                return;
 
             var toNumber = StripWhatsAppPrefix(to);
 
@@ -115,18 +126,25 @@ namespace WhatsAppBot.Services.Implementations
             {
                 Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
             };
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
 
-            var res = await _http.SendAsync(req);
-            var body = await res.Content.ReadAsStringAsync();
-
-            if (!res.IsSuccessStatusCode)
+            try
             {
-                _logger.LogError("Meta send failed to {To}: {Status} {Body}", toNumber, res.StatusCode, body);
-                throw new InvalidOperationException($"Meta send failed: {res.StatusCode}");
-            }
+                var res = await _http.SendAsync(req);
+                var body = await res.Content.ReadAsStringAsync();
 
-            _logger.LogInformation("Meta message sent to {To}. Response: {Body}", toNumber, body);
-        }
+                if (!res.IsSuccessStatusCode)
+                {
+                    _logger.LogError("Meta send failed to {To}: {Status} {Body}", toNumber, res.StatusCode, body);
+                    return; // Provider errors must not crash webhook processing
+                }
+
+                _logger.LogInformation("Meta message sent to {To}. Response: {Body}", toNumber, body);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Meta send transport failure to {To}", toNumber);
+            }
 
         private static string StripWhatsAppPrefix(string number)
         {

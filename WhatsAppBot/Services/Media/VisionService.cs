@@ -34,11 +34,11 @@ namespace WhatsAppBot.Services.Media
         private readonly ILogger<VisionService> _logger;
 
         public VisionService(
-            HttpClient http,
+            IHttpClientFactory httpClientFactory,
             IConfiguration config,
             ILogger<VisionService> logger)
         {
-            _http = http;
+            _http = httpClientFactory.CreateClient();
             _config = config;
             _logger = logger;
         }

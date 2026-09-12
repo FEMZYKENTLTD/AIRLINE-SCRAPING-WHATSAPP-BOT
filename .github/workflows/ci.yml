@@ -1,53 +1,226 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# CI/CD Pipeline — Multi-Channel AI Service Management Platform
+#
+# Every push (any branch) and every pull request to main runs:
+#   1. build-and-test        : restore → build (Release) → test (TRX) → publish
+#   2. security              : configuration validation + secret scanning
+#   3. docker-build-and-smoke: docker build → container start → health checks
+#
+# GitHub-hosted runners provide the .NET 8 SDK via actions/setup-dotnet —
+# no local tooling is ever required. See docs/CI-CD.md.
+# ═══════════════════════════════════════════════════════════════════════════
 name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop, 'arena/**']
+    branches:
+      - "**"
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  DOTNET_VERSION: 8.0.x
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1 — BUILD AND TEST
+  # ─────────────────────────────────────────────────────────────────────────
   build-and-test:
+    name: Build & Test (.NET 8, Release)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
+      - name: Setup .NET 8 SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Print toolchain versions
+        run: |
+          dotnet --info
+          dotnet --list-sdks
 
       - name: Restore dependencies
-        run: dotnet restore
+        run: dotnet restore WhatsAppBot.sln
 
-      - name: Build solution
-        run: dotnet build --no-restore --configuration Release
+      - name: Build solution (Release)
+        run: dotnet build WhatsAppBot.sln -c Release --no-restore
 
-      - name: Run tests
-        run: dotnet test --no-build --configuration Release --verbosity normal --logger "console;verbosity=detailed"
+      # Tests run with a machine-readable TRX logger plus a detailed console
+      # log. If any test fails this step fails (default behavior).
+      - name: Run tests (Release)
+        run: |
+          dotnet test WhatsAppBot.sln -c Release --no-build \
+            --logger "console;verbosity=detailed" \
+            --logger "trx;LogFileName=test-results.trx"
 
-      - name: Publish
-        run: dotnet publish WhatsAppBot/WhatsAppBot.csproj -c Release -o ./publish --no-build
-
-      - name: Upload build artifact
+      - name: Upload test results (TRX)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: publish-output
-          path: ./publish
-          retention-days: 7
+          name: test-results-${{ github.run_id }}
+          path: |
+            **/test-results.trx
+            **/TestResults/**/*.trx
+          retention-days: 30
 
-  docker-build:
+      - name: Publish application output
+        run: dotnet publish WhatsAppBot/WhatsAppBot.csproj -c Release --no-build -o ./artifacts/publish
+
+      - name: Upload publish artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-output-${{ github.run_id }}
+          path: ./artifacts/publish
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2 — SECURITY & CONFIGURATION VALIDATION
+  # ─────────────────────────────────────────────────────────────────────────
+  security:
+    name: Security & Config Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate configuration
+        run: bash scripts/validate-config.sh
+
+      - name: Scan for committed secrets
+        run: bash scripts/secret-scan.sh
+
+      - name: Upload security report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ github.run_id }}
+          path: artifacts/security
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3 — DOCKER BUILD & RUNTIME SMOKE TEST
+  # ─────────────────────────────────────────────────────────────────────────
+  docker-build-and-smoke:
+    name: Docker Build & Smoke Test
     runs-on: ubuntu-latest
     needs: build-and-test
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t airline-service-platform:latest -f WhatsAppBot/Dockerfile WhatsAppBot/
+        run: docker build -t airline-service-platform:ci -f WhatsAppBot/Dockerfile WhatsAppBot/
 
-      - name: Verify Docker image
-        run: docker image inspect airline-service-platform:latest
+      - name: Verify Docker image metadata
+        run: |
+          mkdir -p artifacts/docker
+          docker image inspect airline-service-platform:ci > artifacts/docker/image-metadata.json
+          docker history airline-service-platform:ci > artifacts/docker/image-history.txt
+
+      - name: Start application container
+        run: |
+          docker run -d --name app-smoke \
+            -p 8080:8080 \
+            -e ASPNETCORE_ENVIRONMENT=Production \
+            -e ASPNETCORE_URLS=http://+:8080 \
+            -e DATABASE_CONNECTION_STRING="Data Source=/app/data/whatsappbot.db" \
+            -e WHATSAPP_APP_SECRET="ci-smoke-test-secret-not-for-production" \
+            -e TELEGRAM_WEBHOOK_SECRET="ci-smoke-test-telegram-secret" \
+            airline-service-platform:ci
+
+      - name: Wait for health endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/health > artifacts/health-response.json 2>/dev/null; then
+              echo "✔ Health endpoint is up after ${i}s"
+              cat artifacts/health-response.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "✖ Application failed to become healthy within 60s. Container logs:"
+          docker logs app-smoke
+          exit 1
+
+      - name: Runtime smoke tests
+        run: |
+          BASE=http://localhost:8080
+          fail=0
+
+          check() {
+            local name="$1" expected="$2" actual="$3"
+            if [ "$actual" = "$expected" ]; then
+              echo "✔ $name → $actual"
+            else
+              echo "✖ $name → expected $expected, got $actual"
+              fail=1
+            fi
+          }
+
+          mkdir -p artifacts
+
+          code=$(curl -s -o artifacts/root.json -w "%{http_code}" "$BASE/")
+          check "GET / (service banner)" 200 "$code"
+
+          code=$(curl -s -o artifacts/health.json -w "%{http_code}" "$BASE/health")
+          check "GET /health (liveness)" 200 "$code"
+
+          code=$(curl -s -o artifacts/ready.json -w "%{http_code}" "$BASE/health/ready")
+          check "GET /health/ready (readiness + DB)" 200 "$code"
+
+          code=$(curl -s -o artifacts/webhook-bad-sig.json -w "%{http_code}" \
+            -X POST "$BASE/webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
+            -d '{"entry":[]}')
+          check "POST /webhook (invalid HMAC signature → reject)" 401 "$code"
+
+          code=$(curl -s -o artifacts/telegram-bad-secret.json -w "%{http_code}" \
+            -X POST "$BASE/telegram" \
+            -H "Content-Type: application/json" \
+            -H "X-Telegram-Bot-Api-Secret-Token: definitely-wrong" \
+            -d '{}')
+          check "POST /telegram (invalid secret token → reject)" 401 "$code"
+
+          code=$(curl -s -o artifacts/admin-unauthorized.json -w "%{http_code}" \
+            "$BASE/api/admin/dashboard")
+          check "GET /api/admin/dashboard (no token → reject)" 401 "$code"
+
+          if [ "$fail" = "1" ]; then
+            echo "✖ One or more smoke checks failed. Container logs:"
+            docker logs app-smoke
+            exit 1
+          fi
+          echo "✔ All smoke checks passed"
+
+      - name: Capture container logs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker logs app-smoke > artifacts/app-smoke-logs.txt
+          docker stop app-smoke
+
+      - name: Upload Docker artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-smoke-${{ github.run_id }}
+          path: artifacts
+          retention-days: 30

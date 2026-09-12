@@ -17,11 +17,11 @@ namespace WhatsAppBot.Services.Learning
         private readonly ILogger<EmbeddingService> _logger;
 
         public EmbeddingService(
-            HttpClient http,
+            IHttpClientFactory httpClientFactory,
             IConfiguration config,
             ILogger<EmbeddingService> logger)
         {
-            _http = http;
+            _http = httpClientFactory.CreateClient();
             _config = config;
             _logger = logger;
         }

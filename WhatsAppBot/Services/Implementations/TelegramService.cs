@@ -20,9 +20,9 @@ namespace WhatsAppBot.Services.Implementations
         private readonly string _botToken;
         private readonly string _baseUrl;
 
-        public TelegramService(HttpClient http, IConfiguration config, ILogger<TelegramService> logger)
+        public TelegramService(IHttpClientFactory httpClientFactory, IConfiguration config, ILogger<TelegramService> logger)
         {
-            _http = http;
+            _http = httpClientFactory.CreateClient();
             _logger = logger;
             _botToken = config["Telegram:BotToken"]
                 ?? Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN")
