@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using WhatsAppBot.Models.Flights;
 using WhatsAppBot.Models.Passengers;
@@ -17,10 +17,13 @@ namespace WhatsAppBot.Models
 
         public List<ChatMessage> ConversationHistory { get; set; } = new();
 
-        // ===== Flight Search =====
+        // ===== Flight Search (WhatsApp webhook controller flow) =====
         public FlightSearchDraft FlightDraft { get; set; } = new();
         public FlightStep FlightStep { get; set; } = FlightStep.None;
         public FlightPricingMode FlightPricingMode { get; set; } = FlightPricingMode.Auto;
+
+        // ===== Flight Conversation (FlightConversationService flow) =====
+        public FlightConversationStep ConversationFlightStep { get; set; } = FlightConversationStep.None;
 
         // ===== Booking =====
         public FlightQuote? CurrentQuote { get; set; }

@@ -1,4 +1,5 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -17,6 +18,7 @@ using WhatsAppBot.Models.Passengers;
 using WhatsAppBot.Services.Automation;
 using WhatsAppBot.Services.Flights;
 using WhatsAppBot.Services.Interfaces;
+using WhatsAppBot.Services.Media;
 using WhatsAppBot.Services.Reservations;
 using WhatsAppBot.Services.Scraping;
 
@@ -64,7 +66,9 @@ namespace WhatsAppBot.Controllers
             BookingOrchestrator orchestrator,
             IOptions<ScrapingOptions> scrapingOptions,
             ILogger<WhatsAppWebhookController> logger,
-            IConfiguration config)
+            IConfiguration config,
+            IImageGenerationService imageService,
+            IVisionService visionService)
         {
             _llm = llm;
             _session = session;
@@ -454,8 +458,8 @@ _Powered by Azure OpenAI + Live Data_";
                 session.ResetAll();
                 session.FlightStep = FlightStep.ChooseAirline;
 
-                var airlines = _scrapingOpt.Airlines ?? Array.Empty<AirlineTarget>();
-                if (airlines.Length == 0)
+                var airlines = _scrapingOpt.Airlines ?? new List<AirlineTarget>();
+                if (airlines.Count == 0)
                     return "⚠️ No airlines configured. Please contact support.";
 
                 var list = string.Join("\n", airlines.Select((a, i) =>
@@ -569,13 +573,13 @@ Stock: {stock}
         // ═══════════════════════════════════════════════════════════════════
         private async Task<string> ContinueFlightSearchFlowAsync(UserSession session, string text)
         {
-            var airlines = _scrapingOpt.Airlines ?? Array.Empty<AirlineTarget>();
+            var airlines = _scrapingOpt.Airlines ?? new List<AirlineTarget>();
 
             switch (session.FlightStep)
             {
                 case FlightStep.ChooseAirline:
                     AirlineTarget? chosen = null;
-                    if (int.TryParse(text.Trim(), out var idx) && idx >= 1 && idx <= airlines.Length)
+                    if (int.TryParse(text.Trim(), out var idx) && idx >= 1 && idx <= airlines.Count)
                         chosen = airlines[idx - 1];
                     else
                         chosen = airlines.FirstOrDefault(a =>

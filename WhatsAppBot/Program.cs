@@ -1,27 +1,26 @@
-﻿using Microsoft.AspNetCore.Builder;
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
 using Serilog;
 using Serilog.Events;
-using System;
-using System.Collections.Generic;
 using WhatsAppBot.Data;
 using WhatsAppBot.Extensions;
 using WhatsAppBot.Services;
 using WhatsAppBot.Services.Automation;
 using WhatsAppBot.Services.CaptchaSolver;
-using WhatsAppBot.Services.Implementations;
-using WhatsAppBot.Services.Interfaces;
-using WhatsAppBot.Services.Reservations;
-using WhatsAppBot.Services.Scraping;
 using WhatsAppBot.Services.Flights;
 using WhatsAppBot.Services.Flights.Automations;
-using WhatsAppBot.Models.Flights;
+using WhatsAppBot.Services.Implementations;
+using WhatsAppBot.Services.Interfaces;
 using WhatsAppBot.Services.Learning;
 using WhatsAppBot.Services.Media;
+using WhatsAppBot.Services.Reservations;
+using WhatsAppBot.Services.Scraping;
+using WhatsAppBot.Models.Flights;
 
 // ─── Load .env FIRST before anything else ───────────────────────────────────
 ConfigurationExtensions.LoadDotEnv();
@@ -41,7 +40,7 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     Log.Information("===========================================");
-    Log.Information("  FEMZYK ENTERPRISES - Travel Bot v2.0   ");
+    Log.Information("  FEMZYK ENTERPRISES - Multi-Channel AI Service Platform v3.0  ");
     Log.Information("===========================================");
 
     var builder = WebApplication.CreateBuilder(args);
@@ -58,6 +57,10 @@ try
         ["MetaWhatsApp:VerifyToken"] = Env("WHATSAPP_VERIFY_TOKEN") ?? builder.Configuration["MetaWhatsApp:VerifyToken"],
         ["MetaWhatsApp:AppSecret"] = Env("WHATSAPP_APP_SECRET") ?? builder.Configuration["MetaWhatsApp:AppSecret"],
 
+        // Telegram
+        ["Telegram:BotToken"] = Env("TELEGRAM_BOT_TOKEN") ?? builder.Configuration["Telegram:BotToken"],
+        ["Telegram:WebhookSecret"] = Env("TELEGRAM_WEBHOOK_SECRET") ?? builder.Configuration["Telegram:WebhookSecret"],
+
         // Azure OpenAI
         ["AzureOpenAI:Endpoint"] = Env("AZURE_OPENAI_ENDPOINT") ?? builder.Configuration["AzureOpenAI:Endpoint"],
         ["AzureOpenAI:Deployment"] = Env("AZURE_OPENAI_DEPLOYMENT") ?? builder.Configuration["AzureOpenAI:Deployment"],
@@ -65,9 +68,9 @@ try
         ["AzureOpenAI:ApiVersion"] = Env("AZURE_OPENAI_API_VERSION") ?? builder.Configuration["AzureOpenAI:ApiVersion"],
 
         // Amadeus
-        ["FlightPricing:AmadeusClientId"] = Env("AMADEUS_CLIENT_ID") ?? builder.Configuration["FlightPricing:AmadeusClientId"],
-        ["FlightPricing:AmadeusClientSecret"] = Env("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["FlightPricing:AmadeusClientSecret"],
-        ["FlightPricing:AmadeusBaseUrl"] = Env("AMADEUS_BASE_URL") ?? builder.Configuration["FlightPricing:AmadeusBaseUrl"],
+        ["Amadeus:ClientId"] = Env("AMADEUS_CLIENT_ID") ?? builder.Configuration["Amadeus:ClientId"],
+        ["Amadeus:ClientSecret"] = Env("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["Amadeus:ClientSecret"],
+        ["Amadeus:BaseUrl"] = Env("AMADEUS_BASE_URL") ?? builder.Configuration["Amadeus:BaseUrl"],
 
         // CAPTCHA
         ["CaptchaService:ApiKey"] = Env("CAPTCHA_API_KEY") ?? string.Empty,
@@ -89,12 +92,91 @@ try
         ["Bot:Name"] = Env("BOT_NAME") ?? "Femzyk_Aje_Bot",
         ["Bot:Company"] = Env("BOT_COMPANY") ?? "FEMZYK ENTERPRISES LTD",
         ["Bot:SupportEmail"] = Env("BOT_SUPPORT_EMAIL") ?? "femzykenterprisesltd@gmail.com",
+
+        // JWT
+        ["Jwt:Secret"] = Env("JWT_SECRET") ?? "CHANGE_ME_TO_A_SECURE_RANDOM_STRING_AT_LEAST_32_CHARS",
+        ["Jwt:Issuer"] = Env("JWT_ISSUER") ?? "AirlineServiceManagement",
+        ["Jwt:Audience"] = Env("JWT_AUDIENCE") ?? "AirlineServiceManagement",
+        ["Jwt:ExpiryHours"] = Env("JWT_EXPIRY_HOURS") ?? "24",
+
+        // Admin
+        ["Admin:Username"] = Env("ADMIN_USERNAME") ?? "admin",
+        ["Admin:Password"] = Env("ADMIN_PASSWORD") ?? string.Empty,
     });
 
     // ─── Infrastructure ──────────────────────────────────────────────────────
     builder.Services.AddControllers();
     builder.Services.AddHttpClient();
     builder.Services.AddMemoryCache();
+
+    // ─── Swagger / OpenAPI ───────────────────────────────────────────────────
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen(c =>
+    {
+        c.SwaggerDoc("v1", new OpenApiInfo
+        {
+            Title = "Airline Service Management Platform API",
+            Version = "v3.0",
+            Description = "Multi-channel AI service request management platform with WhatsApp and Telegram support, " +
+                          "flight search/booking, product catalog, and administrative endpoints.",
+            Contact = new OpenApiContact
+            {
+                Name = "FEMZYK ENTERPRISES LTD",
+                Email = "support@example.com"
+            }
+        });
+
+        c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+        {
+            Name = "Authorization",
+            Type = SecuritySchemeType.Http,
+            Scheme = "bearer",
+            BearerFormat = "JWT",
+            In = ParameterLocation.Header,
+            Description = "Enter your JWT token"
+        });
+
+        c.AddSecurityRequirement(new OpenApiSecurityRequirement
+        {
+            {
+                new OpenApiSecurityScheme
+                {
+                    Reference = new OpenApiReference
+                    {
+                        Type = ReferenceType.SecurityScheme,
+                        Id = "Bearer"
+                    }
+                },
+                Array.Empty<string>()
+            }
+        });
+    });
+
+    // ─── JWT Authentication ──────────────────────────────────────────────────
+    var jwtSecret = builder.Configuration["Jwt:Secret"] ?? string.Empty;
+    if (jwtSecret.Length >= 32)
+    {
+        builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+            .AddJwtBearer(options =>
+            {
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidateIssuer = true,
+                    ValidateAudience = true,
+                    ValidateLifetime = true,
+                    ValidateIssuerSigningKey = true,
+                    ValidIssuer = builder.Configuration["Jwt:Issuer"],
+                    ValidAudience = builder.Configuration["Jwt:Audience"],
+                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret))
+                };
+            });
+        builder.Services.AddAuthorization();
+    }
+    else
+    {
+        Log.Warning("JWT secret is too short or default. Admin authentication will be limited.");
+        builder.Services.AddAuthorization();
+    }
 
     // ─── Database ────────────────────────────────────────────────────────────
     var connStr = builder.Configuration.GetConnectionString("DefaultConnection")
@@ -105,35 +187,74 @@ try
     var scrapingSection = builder.Configuration.GetSection("Scraping");
     builder.Services.Configure<ScrapingOptions>(scrapingSection);
 
-    // ─── Core bot services ───────────────────────────────────────────────────
-    builder.Services.AddSingleton<ISessionService, InMemorySessionService>();
-    builder.Services.AddScoped<ILLMService, AzureOpenAiService>();
+    // ═════════════════════════════════════════════════════════════════════════
+    // CORE SERVICES (Multi-Channel Platform)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── User Management ──────────────────────────────────────────────────────
+    builder.Services.AddScoped<IUserService, UserService>();
+
+    // ── Persistent Session Management ────────────────────────────────────────
+    builder.Services.AddScoped<IPersistentSessionService, PersistentSessionService>();
+
+    // ── Conversation / Message Management ────────────────────────────────────
+    builder.Services.AddScoped<IConversationService, ConversationService>();
+
+    // ── Service Request Management ───────────────────────────────────────────
+    builder.Services.AddScoped<IServiceRequestService, ServiceRequestService>();
+
+    // ── Audit Logging ────────────────────────────────────────────────────────
+    builder.Services.AddScoped<IAuditService, AuditService>();
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // CHANNEL SERVICES
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── WhatsApp (Meta Cloud API) ────────────────────────────────────────────
+    builder.Services.AddSingleton<ISessionService, InMemorySessionService>(); // Legacy - still used by WhatsApp controller
     builder.Services.AddSingleton<IWhatsAppService, MetaWhatsAppService>();
+
+    // ── Telegram ─────────────────────────────────────────────────────────────
+    builder.Services.AddSingleton<ITelegramService, TelegramService>();
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // BUSINESS SERVICES
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── LLM / AI Service (wrapped with resilience) ───────────────────────────
+    builder.Services.AddScoped<AzureOpenAiService>();
+    builder.Services.AddScoped<ILLMService>(sp =>
+    {
+        var inner = sp.GetRequiredService<AzureOpenAiService>();
+        var logger = sp.GetRequiredService<ILogger<ResilientLlmService>>();
+        return new ResilientLlmService(inner, logger);
+    });
+
     builder.Services.AddScoped<IChatLogService, ChatLogService>();
     builder.Services.AddScoped<IProductCatalogService, ProductCatalogService>();
     builder.Services.AddScoped<ICatalogSyncService, CatalogSyncService>();
 
-    // ─── CAPTCHA & Automation ─────────────────────────────────────────────────
+    // ── CAPTCHA & Automation ─────────────────────────────────────────────────
     builder.Services.AddScoped<ICaptchaService, CaptchaService>();
     builder.Services.AddSingleton<SelfCaptchaSolver>();
     builder.Services.AddSingleton<ProxyManager>();
     builder.Services.AddSingleton<StealthBrowserManager>();
     builder.Services.AddSingleton<BookingOrchestrator>();
 
-    // ─── Reservation & Payment ────────────────────────────────────────────────
+    // ── Reservation & Payment ────────────────────────────────────────────────
     builder.Services.AddScoped<IReservationService, ReservationService>();
 
-    // ─── Per-airline automation classes ───────────────────────────────────────
+    // ── Per-airline automation classes ────────────────────────────────────────
     builder.Services.AddSingleton<IFlightBookingAutomation, TurkishAirlinesAutomation>();
     builder.Services.AddSingleton<IFlightBookingAutomation, LufthansaAutomation>();
     builder.Services.AddSingleton<IFlightBookingAutomation, AirPeaceAutomation>();
     builder.Services.AddSingleton<IFlightBookingAutomation, ArikAirAutomation>();
 
-    // ─── Background workers ───────────────────────────────────────────────────
+    // ── Background workers ───────────────────────────────────────────────────
     builder.Services.AddHostedService<SessionCleanupService>();
     builder.Services.AddHostedService<CatalogSyncHostedService>();
 
-    // ─── Flight pricing ───────────────────────────────────────────────────────
+    // ── Flight pricing ───────────────────────────────────────────────────────
     builder.Services.Configure<FlightPricingOptions>(builder.Configuration.GetSection("FlightPricing"));
     builder.Services.Configure<AmadeusOptions>(builder.Configuration.GetSection("Amadeus"));
     builder.Services.AddScoped<FlightPricingService>();
@@ -141,16 +262,16 @@ try
     builder.Services.AddScoped<IFlightPricingProvider, AmadeusFlightPricingProvider>();
     builder.Services.AddScoped<IFlightPricingProvider, DeepLinkFlightPricingProvider>();
 
-    // ─── Learning & Knowledge System ──────────────────────────────────────────
+    // ── Learning & Knowledge System ──────────────────────────────────────────
     builder.Services.AddScoped<IEmbeddingService, EmbeddingService>();
     builder.Services.AddScoped<IKnowledgeService, KnowledgeService>();
 
-    // ─── Media Services (Image, Voice, Vision) ───────────────────────────────────
+    // ── Media Services ───────────────────────────────────────────────────────
     builder.Services.AddScoped<IImageGenerationService, ImageGenerationService>();
     builder.Services.AddScoped<IVoiceService, VoiceService>();
     builder.Services.AddScoped<IVisionService, VisionService>();
 
-    // ─── Airline scrapers (one per configured airline) ────────────────────────
+    // ── Airline scrapers ─────────────────────────────────────────────────────
     var scrapingOpts = scrapingSection.Get<ScrapingOptions>() ?? new ScrapingOptions();
     var airlines = scrapingOpts.Airlines ?? new List<AirlineTarget>();
 
@@ -166,7 +287,7 @@ try
             {
                 var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient();
                 var logger = sp.GetRequiredService<ILogger<AirlineProductScraper>>();
-                var options = sp.GetRequiredService<IOptions<ScrapingOptions>>();
+                var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ScrapingOptions>>();
                 return new AirlineProductScraper(http, logger, options, airline);
             });
         }
@@ -184,38 +305,63 @@ try
         Log.Information("Database ready: {ConnStr}", connStr);
     }
 
+    // ─── Middleware ───────────────────────────────────────────────────────────
     app.UseSerilogRequestLogging();
+
+    // Swagger in development
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseSwagger();
+        app.UseSwaggerUI(c =>
+        {
+            c.SwaggerEndpoint("/swagger/v1/swagger.json", "Airline Service Management API v3.0");
+            c.RoutePrefix = "swagger";
+        });
+    }
+
+    app.UseAuthentication();
+    app.UseAuthorization();
     app.MapControllers();
 
-    // Health endpoint
+    // ─── Health endpoint ─────────────────────────────────────────────────────
     app.MapGet("/", () => new
     {
-        service = "FEMZYK ENTERPRISES - WhatsApp Travel Bot",
-        version = "2.0",
+        service = "FEMZYK ENTERPRISES - Multi-Channel AI Service Platform",
+        version = "3.0",
         status = "Running",
         timestamp = DateTime.UtcNow,
+        channels = new[] { "WhatsApp", "Telegram" },
         features = new[]
         {
-            "AI Chat (Azure OpenAI)",
+            "Multi-Channel Messaging (WhatsApp + Telegram)",
+            "AI Chat (Azure OpenAI with fallback)",
             "Flight Search (Amadeus + Scraping)",
             "Flight Booking (API + Automation)",
             "Reservation Management",
-            "Cancellation Engine",
-            "CAPTCHA Bypass (Self-hosted)",
-            "IP Rotation",
-            "Product Catalog"
+            "Service Request Management",
+            "Product Catalog",
+            "Persistent Sessions (7-day expiry)",
+            "User Management",
+            "Admin API (JWT authenticated)",
+            "Audit Logging"
         },
         endpoints = new
         {
-            webhook = "/webhook",
-            alt_webhook = "/api/webhook"
+            webhook_whatsapp = "/webhook",
+            webhook_telegram = "/telegram",
+            admin = "/api/admin",
+            auth = "/api/auth/login",
+            health = "/api/admin/health",
+            swagger = "/swagger"
         }
     });
 
     Log.Information("Bot Name    : {Name}", builder.Configuration["Bot:Name"]);
     Log.Information("Company     : {Company}", builder.Configuration["Bot:Company"]);
-    Log.Information("Webhook     : http://localhost:5260/webhook");
-    Log.Information("Alt Webhook : http://localhost:5260/api/webhook");
+    Log.Information("Webhook WA  : http://localhost:5260/webhook");
+    Log.Information("Webhook TG  : http://localhost:5260/telegram");
+    Log.Information("Admin API   : http://localhost:5260/api/admin");
+    Log.Information("Swagger     : http://localhost:5260/swagger");
     Log.Information("===========================================");
 
     app.Run();

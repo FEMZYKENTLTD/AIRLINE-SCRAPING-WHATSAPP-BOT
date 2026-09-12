@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -13,6 +13,10 @@ using WhatsAppBot.Services.Scraping;
 
 namespace WhatsAppBot.Services.Flights
 {
+    /// <summary>
+    /// Manages the flight search conversation flow in a multi-step manner.
+    /// Uses FlightConversationStep for tracking progress.
+    /// </summary>
     public class FlightConversationService
     {
         private readonly FlightPricingService _pricing;
@@ -30,12 +34,12 @@ namespace WhatsAppBot.Services.Flights
         }
 
         public bool IsFlightFlowActive(UserSession session)
-            => session.FlightStep != FlightConversationStep.None;
+            => session.ConversationFlightStep != FlightConversationStep.None;
 
         public Task<string> StartAsync(UserSession session)
         {
             session.FlightDraft.Reset();
-            session.FlightStep = FlightConversationStep.AwaitingMode;
+            session.ConversationFlightStep = FlightConversationStep.AwaitingMode;
 
             return Task.FromResult(
                 "✈️ *Flight Search*\n\n" +
@@ -51,7 +55,7 @@ namespace WhatsAppBot.Services.Flights
         {
             text = (text ?? "").Trim();
 
-            switch (session.FlightStep)
+            switch (session.ConversationFlightStep)
             {
                 case FlightConversationStep.AwaitingMode:
                     {
@@ -59,8 +63,13 @@ namespace WhatsAppBot.Services.Flights
                         if (mode is not ("auto" or "amadeus" or "deeplink" or "scrape"))
                             return "Reply with: `auto` / `amadeus` / `deeplink` / `scrape`";
 
-                        session.FlightPricingMode = mode;
-                        session.FlightStep = FlightConversationStep.AwaitingTripType;
+                        session.FlightPricingMode = mode switch
+                        {
+                            "amadeus" => FlightPricingMode.Amadeus,
+                            "deeplink" => FlightPricingMode.DeepLink,
+                            _ => FlightPricingMode.Auto
+                        };
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingTripType;
                         return "Trip type? Reply: `oneway` or `return`";
                     }
 
@@ -70,8 +79,8 @@ namespace WhatsAppBot.Services.Flights
                         if (t is not ("oneway" or "return"))
                             return "Reply: `oneway` or `return`";
 
-                        session.FlightDraft.TripType = t;
-                        session.FlightStep = FlightConversationStep.AwaitingFrom;
+                        session.FlightDraft.IsRoundTrip = t == "return";
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingFrom;
                         return "From (IATA code). Example: `LOS`";
                     }
 
@@ -81,7 +90,7 @@ namespace WhatsAppBot.Services.Flights
                         if (code == null) return "Use a 3-letter airport code. Example: `LOS`";
 
                         session.FlightDraft.From = code;
-                        session.FlightStep = FlightConversationStep.AwaitingTo;
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingTo;
                         return "To (IATA code). Example: `LHR`";
                     }
 
@@ -91,10 +100,10 @@ namespace WhatsAppBot.Services.Flights
                         if (code == null) return "Use a 3-letter airport code. Example: `LHR`";
 
                         if (code == session.FlightDraft.From)
-                            return "From and To can’t be the same. Enter a different destination code.";
+                            return "From and To can't be the same. Enter a different destination code.";
 
                         session.FlightDraft.To = code;
-                        session.FlightStep = FlightConversationStep.AwaitingDepartDate;
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingDepartDate;
                         return "Departure date (YYYY-MM-DD). Example: `2026-03-10`";
                     }
 
@@ -105,14 +114,14 @@ namespace WhatsAppBot.Services.Flights
 
                         session.FlightDraft.DepartDate = d.Value;
 
-                        if (session.FlightDraft.TripType == "return")
+                        if (session.FlightDraft.IsRoundTrip)
                         {
-                            session.FlightStep = FlightConversationStep.AwaitingReturnDate;
+                            session.ConversationFlightStep = FlightConversationStep.AwaitingReturnDate;
                             return "Return date (YYYY-MM-DD). Example: `2026-03-20`";
                         }
 
-                        session.FlightStep = FlightConversationStep.AwaitingPassengers;
-                        return "Passengers (1-9). Example: `1`";
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingPassengers;
+                        return "Passengers (Adults Children Infants). Example: `1 0 0`";
                     }
 
                 case FlightConversationStep.AwaitingReturnDate:
@@ -121,20 +130,24 @@ namespace WhatsAppBot.Services.Flights
                         if (d == null) return "Enter return date like `YYYY-MM-DD` (example: 2026-03-20).";
 
                         if (session.FlightDraft.DepartDate != null && d.Value < session.FlightDraft.DepartDate.Value)
-                            return "Return date can’t be before departure date. Try again.";
+                            return "Return date can't be before departure date. Try again.";
 
                         session.FlightDraft.ReturnDate = d.Value;
-                        session.FlightStep = FlightConversationStep.AwaitingPassengers;
-                        return "Passengers (1-9). Example: `1`";
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingPassengers;
+                        return "Passengers (Adults Children Infants). Example: `1 0 0`";
                     }
 
                 case FlightConversationStep.AwaitingPassengers:
                     {
-                        if (!int.TryParse(text, out var pax) || pax < 1 || pax > 9)
-                            return "Passengers must be 1 to 9. Example: `2`";
+                        if (!TryParsePassengers(text, out var adults, out var children, out var infants))
+                            return "Invalid format. Reply exactly like: `1 0 0`";
+                        if (adults < 1) return "Must have at least 1 adult.";
+                        if (infants > adults) return "Infants cannot exceed number of adults.";
 
-                        session.FlightDraft.Passengers = pax;
-                        session.FlightStep = FlightConversationStep.AwaitingCabin;
+                        session.FlightDraft.Adults = adults;
+                        session.FlightDraft.Children = children;
+                        session.FlightDraft.Infants = infants;
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingCabin;
                         return "Cabin? Reply: `economy` / `premium` / `business` / `first`";
                     }
 
@@ -144,14 +157,13 @@ namespace WhatsAppBot.Services.Flights
                         if (c is not ("economy" or "premium" or "business" or "first"))
                             return "Reply: `economy` / `premium` / `business` / `first`";
 
-                        session.FlightDraft.Cabin = c;
-                        session.FlightStep = FlightConversationStep.AwaitingAirlineChoice;
+                        session.ConversationFlightStep = FlightConversationStep.AwaitingAirlineChoice;
 
                         var airlines = _scrapeOpt.Airlines ?? new List<AirlineTarget>();
                         if (airlines.Count == 0)
                         {
-                            session.FlightDraft.AirlineSourceKey = "all";
-                            session.FlightStep = FlightConversationStep.ReadyToQuote;
+                            session.FlightDraft.SourceKey = "all";
+                            session.ConversationFlightStep = FlightConversationStep.ReadyToQuote;
                             return await QuoteAsync(session, ct);
                         }
 
@@ -172,8 +184,8 @@ namespace WhatsAppBot.Services.Flights
                         if (choice != "all" && !airlines.Any(a => a.SourceKey.Equals(choice, StringComparison.OrdinalIgnoreCase)))
                             return "Reply `all` or a valid airline key from the list I gave you.";
 
-                        session.FlightDraft.AirlineSourceKey = choice;
-                        session.FlightStep = FlightConversationStep.ReadyToQuote;
+                        session.FlightDraft.SourceKey = choice;
+                        session.ConversationFlightStep = FlightConversationStep.ReadyToQuote;
                         return await QuoteAsync(session, ct);
                     }
 
@@ -181,7 +193,7 @@ namespace WhatsAppBot.Services.Flights
                     return await QuoteAsync(session, ct);
 
                 default:
-                    session.FlightStep = FlightConversationStep.None;
+                    session.ConversationFlightStep = FlightConversationStep.None;
                     return "Flight flow reset. Type `/flight` to start again.";
             }
         }
@@ -191,21 +203,21 @@ namespace WhatsAppBot.Services.Flights
             var airlines = _scrapeOpt.Airlines ?? new List<AirlineTarget>();
             if (airlines.Count == 0)
             {
-                session.FlightStep = FlightConversationStep.None;
+                session.ConversationFlightStep = FlightConversationStep.None;
                 return "No airlines configured in appsettings under `Scraping:Airlines`.";
             }
 
-            var targets = session.FlightDraft.AirlineSourceKey == "all"
+            var targets = session.FlightDraft.SourceKey == "all"
                 ? airlines
-                : airlines.Where(a => a.SourceKey.Equals(session.FlightDraft.AirlineSourceKey, StringComparison.OrdinalIgnoreCase)).ToList();
+                : airlines.Where(a => a.SourceKey.Equals(session.FlightDraft.SourceKey, StringComparison.OrdinalIgnoreCase)).ToList();
 
             var draft = session.FlightDraft;
 
             var sb = new StringBuilder();
             sb.AppendLine("🔎 *Searching flights...*");
             sb.AppendLine($"Route: {draft.From} → {draft.To}");
-            sb.AppendLine($"Date: {draft.DepartDate:yyyy-MM-dd}" + (draft.TripType == "return" ? $" → {draft.ReturnDate:yyyy-MM-dd}" : ""));
-            sb.AppendLine($"Passengers: {draft.Passengers}, Cabin: {draft.Cabin}");
+            sb.AppendLine($"Date: {draft.DepartDate:yyyy-MM-dd}" + (draft.IsRoundTrip && draft.ReturnDate.HasValue ? $" → {draft.ReturnDate:yyyy-MM-dd}" : ""));
+            sb.AppendLine($"Passengers: {draft.Adults}A {draft.Children}C {draft.Infants}I");
             sb.AppendLine($"Mode: {session.FlightPricingMode}");
             sb.AppendLine();
 
@@ -214,10 +226,9 @@ namespace WhatsAppBot.Services.Flights
                 var q = await _pricing.GetQuoteAsync(airline, draft, session.FlightPricingMode, ct);
 
                 sb.AppendLine($"*{airline.Name}* ({airline.SourceKey})");
-                sb.AppendLine($"Provider: {q.Provider}");
 
-                if (q.Amount != null)
-                    sb.AppendLine($"Price: {q.Currency} {q.Amount:0,0} {(q.IsPriceExact ? "(exact)" : "(estimate)")}");
+                if (q.Price.HasValue)
+                    sb.AppendLine($"Price: {q.Currency} {q.Price.Value:N0} {(q.IsPriceExact ? "(exact)" : "(estimate)")}");
 
                 sb.AppendLine(q.Message);
 
@@ -227,7 +238,7 @@ namespace WhatsAppBot.Services.Flights
                 sb.AppendLine();
             }
 
-            session.FlightStep = FlightConversationStep.None;
+            session.ConversationFlightStep = FlightConversationStep.None;
             return sb.ToString().Trim();
         }
 
@@ -245,6 +256,21 @@ namespace WhatsAppBot.Services.Flights
             if (DateOnly.TryParseExact(input, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
                 return d;
             return null;
+        }
+
+        private static bool TryParsePassengers(string input, out int adults, out int children, out int infants)
+        {
+            adults = 0; children = 0; infants = 0;
+            var parts = (input ?? "").Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 1 && int.TryParse(parts[0], out var single))
+            {
+                adults = single;
+                return adults >= 1;
+            }
+            if (parts.Length != 3) return false;
+            return int.TryParse(parts[0], out adults) &&
+                   int.TryParse(parts[1], out children) &&
+                   int.TryParse(parts[2], out infants);
         }
     }
 }
