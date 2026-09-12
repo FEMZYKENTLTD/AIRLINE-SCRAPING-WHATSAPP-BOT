@@ -22,10 +22,12 @@ namespace WhatsAppBot.Controllers
     /// IntentRouter / FlightConversation / LLM). Business rules are
     /// centralized — this adapter only does Telegram parsing/presentation.
     /// </summary>
+    // NOTE: must be `partial` — the [GeneratedRegex] source generator emits a
+    // generated partial class for the compiled regex method.
     [ApiController]
     [Route("telegram")]
     [Route("api/telegram")]
-    public class TelegramWebhookController : ControllerBase
+    public partial class TelegramWebhookController : ControllerBase
     {
         private readonly ITelegramService _telegram;
         private readonly IPersistentSessionService _sessionService;

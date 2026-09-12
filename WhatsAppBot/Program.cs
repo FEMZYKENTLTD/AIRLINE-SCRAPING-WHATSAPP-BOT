@@ -452,3 +452,6 @@ finally
 // ─── Helper ──────────────────────────────────────────────────────────────────
 static string? Env(string key) =>
     Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : null;
+
+// Marker class so integration tests can use WebApplicationFactory<Program>.
+public partial class Program { }
