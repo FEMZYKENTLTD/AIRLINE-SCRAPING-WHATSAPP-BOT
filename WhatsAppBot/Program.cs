@@ -73,6 +73,15 @@ try
         ["Amadeus:ClientSecret"] = Env("AMADEUS_CLIENT_SECRET") ?? builder.Configuration["Amadeus:ClientSecret"],
         ["Amadeus:BaseUrl"] = Env("AMADEUS_BASE_URL") ?? builder.Configuration["Amadeus:BaseUrl"],
 
+        // LLM
+        ["LLM:MaxTokens"] = Env("LLM_MAX_TOKENS") ?? builder.Configuration["LLM:MaxTokens"],
+        ["LLM:Temperature"] = Env("LLM_TEMPERATURE") ?? builder.Configuration["LLM:Temperature"],
+        ["LLM:MaxHistoryMessages"] = Env("LLM_MAX_HISTORY_MESSAGES") ?? builder.Configuration["LLM:MaxHistoryMessages"],
+
+        // Session (7-day inactivity expiry by default)
+        ["Session:TimeoutMinutes"] = Env("SESSION_TIMEOUT_MINUTES") ?? builder.Configuration["Session:TimeoutMinutes"],
+        ["Session:CleanupIntervalMinutes"] = Env("SESSION_CLEANUP_INTERVAL_MINUTES") ?? builder.Configuration["Session:CleanupIntervalMinutes"],
+
         // CAPTCHA
         ["CaptchaService:ApiKey"] = Env("CAPTCHA_API_KEY") ?? string.Empty,
         ["CaptchaService:Provider"] = Env("CAPTCHA_SERVICE_PROVIDER") ?? "self",
