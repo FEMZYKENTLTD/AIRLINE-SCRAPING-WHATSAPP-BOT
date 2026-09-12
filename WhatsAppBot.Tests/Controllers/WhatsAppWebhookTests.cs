@@ -81,6 +81,36 @@ namespace WhatsAppBot.Tests.Controllers
                 .Setup(s => s.ExistsByProviderMessageIdAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(false);
 
+            // Loosely stub every Task-returning call the controller makes
+            // (unstubbed Moq methods return null → NRE on await)
+            _auditService
+                .Setup(a => a.LogAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(),
+                    It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>(),
+                    It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            _chatLog
+                .Setup(l => l.LogInboundAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(),
+                    It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(Task.CompletedTask);
+            _chatLog
+                .Setup(l => l.LogOutboundAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(),
+                    It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(Task.CompletedTask);
+            _conversationService
+                .Setup(c => c.LogOutboundAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                    It.IsAny<int?>(), It.IsAny<int?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new Message { Id = 101 });
+            _sessionService
+                .Setup(s => s.UpdateSessionAsync(It.IsAny<AppSession>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            _userService
+                .Setup(u => u.TouchActivityAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            _userService
+                .Setup(u => u.UpdateProfileAsync(It.IsAny<int>(), It.IsAny<string?>(), It.IsAny<string?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new User { Id = 1 });
+
             return new WhatsAppWebhookController(
                 _llm.Object, _whatsApp.Object, _userService.Object,
                 _sessionService.Object, _conversationService.Object,
@@ -338,4 +368,5 @@ namespace WhatsAppBot.Tests.Controllers
                 }}]
             }}";
     }
+}
 }

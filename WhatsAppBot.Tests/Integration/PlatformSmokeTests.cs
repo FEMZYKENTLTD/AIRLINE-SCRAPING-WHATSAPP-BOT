@@ -151,7 +151,7 @@ namespace WhatsAppBot.Tests.Integration
                 new StringContent(payload, Encoding.UTF8, "application/json")
                 {
                     Headers = { { "X-Hub-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000" } }
-                );
+                });
 
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
                 "a payload with an invalid HMAC must never be processed");
@@ -169,7 +169,7 @@ namespace WhatsAppBot.Tests.Integration
                 new StringContent(payload, Encoding.UTF8, "application/json")
                 {
                     Headers = { { "X-Hub-Signature-256", signature } }
-                );
+                });
 
             response.StatusCode.Should().Be(HttpStatusCode.OK);
         }
@@ -184,7 +184,7 @@ namespace WhatsAppBot.Tests.Integration
                 new StringContent("{}", Encoding.UTF8, "application/json")
                 {
                     Headers = { { "X-Telegram-Bot-Api-Secret-Token", "definitely-wrong" } }
-                );
+                });
 
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
         }
@@ -199,7 +199,7 @@ namespace WhatsAppBot.Tests.Integration
                 new StringContent("{}", Encoding.UTF8, "application/json")
                 {
                     Headers = { { "X-Telegram-Bot-Api-Secret-Token", "test-telegram-secret" } }
-                );
+                });
 
             response.StatusCode.Should().Be(HttpStatusCode.OK);
         }
