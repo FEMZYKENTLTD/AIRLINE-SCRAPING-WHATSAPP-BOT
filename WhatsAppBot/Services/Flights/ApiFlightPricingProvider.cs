@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Threading;
@@ -50,7 +50,7 @@ namespace WhatsAppBot.Services.Flights
                     sourceKey = airline.SourceKey,
                     from = req.From,
                     to = req.To,
-                    trip = req.TripType,
+                    trip = req.IsRoundTrip ? "return" : "oneway",
                     depart = req.DepartDate?.ToString("yyyy-MM-dd"),
                     ret = req.ReturnDate?.ToString("yyyy-MM-dd"),
                     adults = req.Adults,
@@ -76,7 +76,7 @@ namespace WhatsAppBot.Services.Flights
                 {
                     SourceKey = airline.SourceKey,
                     IsPriceExact = true,
-                    TotalPrice = data.TotalPrice,
+                    Price = data.TotalPrice,
                     Currency = data.Currency,
                     BookingUrl = data.BookingUrl ?? airline.StartUrl,
                     Message = "Live price returned from API."

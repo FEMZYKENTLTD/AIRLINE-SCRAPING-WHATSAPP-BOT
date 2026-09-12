@@ -100,7 +100,7 @@ namespace WhatsAppBot.Services.Payments
                         ["reservationCode"] = reservationCode,
                         ["phoneNumber"] = phoneNumber
                     }
-                }, options: null, ct: ct);
+                });
 
                 var record = PersistRecord(reservationCode, phoneNumber, amount, currency,
                     "stripe", intent.Id, intent.ClientSecret, PaymentStatus.Pending, null);
