@@ -1,4 +1,4 @@
-﻿# Visual Studio temporary files
+# Visual Studio temporary files
 .vs/
 *.suo
 *.user
@@ -39,3 +39,20 @@ bld/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Test results
+TestResults/
+coverage/
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Publish output
+publish/

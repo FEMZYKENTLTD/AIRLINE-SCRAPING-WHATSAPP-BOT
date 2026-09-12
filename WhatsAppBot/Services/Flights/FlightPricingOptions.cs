@@ -1,13 +1,18 @@
-﻿namespace WhatsAppBot.Services.Flights
+namespace WhatsAppBot.Services.Flights
 {
+    /// <summary>
+    /// Configuration for flight pricing provider behavior.
+    /// Bound from appsettings.json section "FlightPricing".
+    /// </summary>
     public class FlightPricingOptions
     {
-        // If you later add your own pricing API
-        public bool EnableApiPricing { get; set; } = false;
-        public string? ApiBaseUrl { get; set; }
-        public string? ApiKey { get; set; }
+        /// <summary>Allow Amadeus API provider.</summary>
+        public bool EnableAmadeus { get; set; } = false;
 
-        // allow booking deep-links when API isn't available
+        /// <summary>Allow booking deep-links when API isn't available.</summary>
         public bool EnableDeepLinkFallback { get; set; } = true;
+
+        /// <summary>Allow best-effort scrape-based pricing.</summary>
+        public bool EnableScrapeFallback { get; set; } = true;
     }
 }
