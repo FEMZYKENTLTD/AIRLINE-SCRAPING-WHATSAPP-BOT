@@ -47,11 +47,19 @@ namespace WhatsAppBot.Tests.Integration
 
         /// <summary>
         /// Shared factory options: a unique temp SQLite file per test class.
+        /// The env var is set because Program.cs maps DATABASE_CONNECTION_STRING
+        /// (environment) into ConnectionStrings:Default.
         /// </summary>
         public sealed class FactoryOptions
         {
             public string DbPath { get; } =
                 Path.Combine(Path.GetTempPath(), $"whatsappbot-tests-{Guid.NewGuid():N}.db");
+
+            public FactoryOptions()
+            {
+                Environment.SetEnvironmentVariable("DATABASE_CONNECTION_STRING",
+                    $"Data Source={DbPath}");
+            }
         }
 
         private HttpClient CreateClient() => _factory.CreateClient();

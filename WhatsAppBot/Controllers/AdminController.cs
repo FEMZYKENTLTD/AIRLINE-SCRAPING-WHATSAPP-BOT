@@ -163,10 +163,25 @@ namespace WhatsAppBot.Controllers
             // Project only database columns (IsExpired is a computed property
             // and cannot be translated to SQL); compute it client-side below.
             var now = DateTime.UtcNow;
-            var sessions = await query
+            var projected = await query
                 .OrderByDescending(s => s.LastActivityAtUtc)
                 .Skip(skip)
                 .Take(take)
+                .Select(s => new
+                {
+                    s.SessionId,
+                    s.Channel,
+                    s.ConversationId,
+                    s.UserId,
+                    s.CurrentState,
+                    s.WorkflowStep,
+                    s.CreatedAtUtc,
+                    s.LastActivityAtUtc,
+                    s.ExpiresAtUtc
+                })
+                .ToListAsync(ct);
+
+            var sessions = projected
                 .Select(s => new
                 {
                     sessionId = s.SessionId,
@@ -177,23 +192,8 @@ namespace WhatsAppBot.Controllers
                     workflowStep = s.WorkflowStep,
                     createdAt = s.CreatedAtUtc,
                     lastActivity = s.LastActivityAtUtc,
-                    expiresAt = s.ExpiresAtUtc
-                })
-                .ToListAsync(ct);
-
-            sessions = sessions
-                .Select(s => new
-                {
-                    s.sessionId,
-                    s.channel,
-                    s.conversationId,
-                    s.userId,
-                    s.currentState,
-                    s.workflowStep,
-                    s.createdAt,
-                    s.lastActivity,
-                    s.expiresAt,
-                    isExpired = s.expiresAt.HasValue && s.expiresAt.Value < now
+                    expiresAt = s.ExpiresAtUtc,
+                    isExpired = s.ExpiresAtUtc.HasValue && s.ExpiresAtUtc.Value < now
                 })
                 .ToList();
 
@@ -220,10 +220,27 @@ namespace WhatsAppBot.Controllers
             if (!string.IsNullOrWhiteSpace(direction))
                 query = query.Where(m => m.Direction == direction);
 
-            var messages = await query
+            // Truncate client-side: EF cannot translate range/indexer
+            // expressions inside the query.
+            var messageRows = await query
                 .OrderByDescending(m => m.Timestamp)
                 .Skip(skip)
                 .Take(take)
+                .Select(m => new
+                {
+                    m.Id,
+                    m.Channel,
+                    m.Direction,
+                    m.MessageType,
+                    m.Content,
+                    m.ProviderUserId,
+                    m.ProviderMessageId,
+                    m.ProcessingStatus,
+                    m.Timestamp
+                })
+                .ToListAsync(ct);
+
+            var messages = messageRows
                 .Select(m => new
                 {
                     id = m.Id,
@@ -237,7 +254,7 @@ namespace WhatsAppBot.Controllers
                     processingStatus = m.ProcessingStatus,
                     timestamp = m.Timestamp
                 })
-                .ToListAsync(ct);
+                .ToList();
 
             var total = await _db.Messages.CountAsync(ct);
 

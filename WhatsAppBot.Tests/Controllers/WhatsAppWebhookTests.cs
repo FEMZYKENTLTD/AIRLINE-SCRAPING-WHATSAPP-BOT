@@ -163,9 +163,22 @@ namespace WhatsAppBot.Tests.Controllers
             var ctx = new DefaultHttpContext();
             controller.ControllerContext = new ControllerContext { HttpContext = ctx };
 
-            // New user, fresh session
-            var user = new User { Id = 1, DisplayName = "John" };
-            var session = new AppSession { Id = 10, SessionId = "S1" };
+            // Existing verified user with an active (persisted) flow context
+            var user = new User { Id = 1, DisplayName = "John", Email = "j@x.com" };
+            var verifiedFlow = FlowContext.FromUserSession(new UserSession
+            {
+                PhoneNumber = "2348012345678",
+                Name = "John",
+                Email = "j@x.com",
+                State = UserState.Verified
+            });
+            var session = new AppSession
+            {
+                Id = 10,
+                SessionId = "S1",
+                CurrentState = "Verified",
+                ContextData = verifiedFlow.ToJson()
+            };
 
             _userService
                 .Setup(u => u.FindOrCreateByChannelAsync("whatsapp", "2348012345678", null, It.IsAny<CancellationToken>()))

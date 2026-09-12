@@ -57,9 +57,8 @@ namespace WhatsAppBot.Services.Flights
                 return new FlightQuote
                 {
                     SourceKey = airline.SourceKey,
-                    Provider = Name,
                     IsPriceExact = false,
-                    Amount = amt,
+                    Price = amt,
                     Currency = currency,
                     BookingUrl = airline.StartUrl,
                     Message =

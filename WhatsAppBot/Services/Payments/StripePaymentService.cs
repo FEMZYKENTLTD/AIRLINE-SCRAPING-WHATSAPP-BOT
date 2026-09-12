@@ -90,7 +90,7 @@ namespace WhatsAppBot.Services.Payments
             {
                 StripeConfiguration.ApiKey = _config["Stripe:SecretKey"];
 
-                var service = new PaymentIntentsService();
+                var service = new PaymentIntentService(); // Stripe.net v46 naming (singular)
                 var intent = await service.CreateAsync(new PaymentIntentCreateOptions
                 {
                     Amount = ToSmallestUnit(amount, currency),

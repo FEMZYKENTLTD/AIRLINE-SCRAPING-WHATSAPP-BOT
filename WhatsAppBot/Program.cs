@@ -24,7 +24,7 @@ using WhatsAppBot.Models.Flights;
 using WhatsAppBot.Models.Scraping;
 
 // ─── Load .env FIRST before anything else ───────────────────────────────────
-ConfigurationExtensions.LoadDotEnv();
+WhatsAppBot.Extensions.ConfigurationExtensions.LoadDotEnv();
 
 // ─── Serilog bootstrap ───────────────────────────────────────────────────────
 Log.Logger = new LoggerConfiguration()

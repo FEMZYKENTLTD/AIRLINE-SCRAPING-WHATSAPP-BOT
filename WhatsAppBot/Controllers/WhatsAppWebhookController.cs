@@ -1329,7 +1329,7 @@ We couldn't automatically cancel this reservation. Please contact support:
                 await _auditService.LogAsync(
                     "SERVICE_REQUEST_CREATED", "ServiceRequest", sr.RequestCode,
                     actorId: user.Id.ToString(), channel: Channel,
-                    details: requestType, ct);
+                    details: requestType, ct: ct);
 
                 return sr;
             }
@@ -1350,7 +1350,7 @@ We couldn't automatically cancel this reservation. Please contact support:
                 await _auditService.LogAsync(
                     "SERVICE_REQUEST_COMPLETED", "ServiceRequest", sr.RequestCode,
                     actorId: "system", channel: Channel,
-                    details: statusMessage, ct);
+                    details: statusMessage, ct: ct);
             }
             catch (Exception ex)
             {
@@ -1368,7 +1368,7 @@ We couldn't automatically cancel this reservation. Please contact support:
                 await _auditService.LogAsync(
                     "SERVICE_REQUEST_FAILED", "ServiceRequest", sr.RequestCode,
                     actorId: "system", channel: Channel,
-                    details: reason, ct);
+                    details: reason, ct: ct);
             }
             catch (Exception ex)
             {
